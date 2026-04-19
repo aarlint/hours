@@ -300,6 +300,28 @@ func addColumnIfNotExists(db *sql.DB, tableName, columnName, columnType string) 
 	return nil
 }
 
+func columnExists(db *sql.DB, tableName, columnName string) (bool, error) {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", tableName))
+	if err != nil {
+		return false, fmt.Errorf("failed to get table info for %s: %w", tableName, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, dataType string
+		var notNull, primaryKey int
+		var defaultValue *string
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, fmt.Errorf("failed to scan column info: %w", err)
+		}
+		if name == columnName {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func restructureForContracts(db *sql.DB) error {
 	fmt.Println("Restructuring database for contract-based billing...")
 
@@ -311,9 +333,20 @@ func restructureForContracts(db *sql.DB) error {
 		return fmt.Errorf("failed to add contract_id to time_entries: %w", err)
 	}
 
+	// Fresh databases don't have the legacy hourly_rate column on clients;
+	// skip legacy data migration entirely in that case.
+	hasRate, err := columnExists(db, "clients", "hourly_rate")
+	if err != nil {
+		return fmt.Errorf("failed to check clients schema: %w", err)
+	}
+	if !hasRate {
+		fmt.Println("No legacy hourly_rate column on clients — skipping contract backfill.")
+		return nil
+	}
+
 	// Step 3: Check if we have any existing clients with rates that need migration
 	var clientCount int
-	err := db.QueryRow("SELECT COUNT(*) FROM clients WHERE hourly_rate IS NOT NULL AND hourly_rate > 0").Scan(&clientCount)
+	err = db.QueryRow("SELECT COUNT(*) FROM clients WHERE hourly_rate IS NOT NULL AND hourly_rate > 0").Scan(&clientCount)
 	if err != nil {
 		return fmt.Errorf("failed to check existing clients: %w", err)
 	}

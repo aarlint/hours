@@ -48,6 +48,16 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Build frontend (required for go:embed)
+        working-directory: internal/web
+        run: |
+          npm ci || npm install
+          npm run build
+
       - name: Install cross-compiler (Linux ARM64)
         if: matrix.goos == 'linux' && matrix.goarch == 'arm64'
         run: |
