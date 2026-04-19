@@ -6,7 +6,7 @@ A comprehensive MCP (Model Context Protocol) server that enables contract-based 
 
 ### 📦 Download & Install
 
-1. **Download the binary** for your platform from [Latest Release](https://github.com/aarlint/hours-mcp/releases/latest):
+1. **Download the binary** for your platform from [Latest Release](https://github.com/aarlint/hours/releases/latest):
 
    | Platform | Download |
    |----------|----------|
@@ -214,7 +214,7 @@ For developers who want to build from source:
 #### Build Steps
 ```bash
 # Clone the repository
-git clone https://github.com/aarlint/hours-mcp.git
+git clone https://github.com/aarlint/hours.git
 cd hours-mcp
 
 # Download dependencies

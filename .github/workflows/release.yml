@@ -1,4 +1,4 @@
-name: Release Binaries
+name: Release
 
 on:
   push:
@@ -7,172 +7,209 @@ on:
 
 env:
   GO_VERSION: '1.21'
+  NODE_VERSION: '20'
 
 permissions:
   contents: write
 
 jobs:
-  build-and-release:
-    name: Build and Release
+  build-cli:
+    name: Build CLI (${{ matrix.name }})
     strategy:
       matrix:
         include:
           - os: macos-latest
             goos: darwin
             goarch: amd64
-            name: hours-mcp-darwin-amd64
+            name: hours-darwin-amd64
           - os: macos-latest
             goos: darwin
             goarch: arm64
-            name: hours-mcp-darwin-arm64
+            name: hours-darwin-arm64
           - os: ubuntu-latest
             goos: linux
             goarch: amd64
-            name: hours-mcp-linux-amd64
+            name: hours-linux-amd64
           - os: ubuntu-latest
             goos: linux
             goarch: arm64
-            name: hours-mcp-linux-arm64
+            name: hours-linux-arm64
           - os: windows-latest
             goos: windows
             goarch: amd64
-            name: hours-mcp-windows-amd64.exe
+            name: hours-windows-amd64.exe
 
     runs-on: ${{ matrix.os }}
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: ${{ env.GO_VERSION }}
+      - uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
 
-    - name: Install dependencies (Linux ARM64)
-      if: matrix.goos == 'linux' && matrix.goarch == 'arm64'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Install cross-compiler (Linux ARM64)
+        if: matrix.goos == 'linux' && matrix.goarch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
 
-    - name: Install dependencies (Windows)
-      if: matrix.goos == 'windows'
-      run: |
-        # Windows builds will use CGO with the default gcc
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 1
+          CC: ${{ matrix.goos == 'linux' && matrix.goarch == 'arm64' && 'aarch64-linux-gnu-gcc' || '' }}
+        run: |
+          go mod download
+          go build -ldflags="-s -w -X main.version=${{ github.ref_name }}" -o ${{ matrix.name }} .
 
-    - name: Build binary
-      env:
-        GOOS: ${{ matrix.goos }}
-        GOARCH: ${{ matrix.goarch }}
-        CGO_ENABLED: 1
-        CC: ${{ matrix.goos == 'linux' && matrix.goarch == 'arm64' && 'aarch64-linux-gnu-gcc' || '' }}
-      run: |
-        go mod download
-        go build -ldflags="-s -w -X main.version=${{ github.ref_name }}" -o ${{ matrix.name }} .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.name }}
+          path: ${{ matrix.name }}
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: binaries-${{ matrix.name }}
-        path: ${{ matrix.name }}
+  build-app:
+    name: Build macOS App (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            platform: darwin/arm64
+            zipname: Hours-darwin-arm64.zip
+          - arch: amd64
+            platform: darwin/amd64
+            zipname: Hours-darwin-amd64.zip
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Wails
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Install frontend deps
+        working-directory: internal/web
+        run: npm ci || npm install
+
+      - name: Build frontend
+        working-directory: internal/web
+        run: npm run build
+
+      - name: Build Hours.app
+        run: |
+          $(go env GOPATH)/bin/wails build -clean -platform ${{ matrix.platform }} \
+            -ldflags="-X main.version=${{ github.ref_name }}"
+
+      - name: Zip app bundle
+        run: |
+          cd build/bin
+          ditto -c -k --keepParent Hours.app ../../${{ matrix.zipname }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ matrix.arch }}
+          path: ${{ matrix.zipname }}
 
   create-release:
     name: Create Release
-    needs: build-and-release
+    needs: [build-cli, build-app]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
-
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Download artifacts
-      uses: actions/download-artifact@v4
-      with:
-        pattern: binaries-*
-        path: ./binaries
-        merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*'
+          path: ./artifacts
+          merge-multiple: true
 
-    - name: Create checksums
-      run: |
-        cd binaries
-        sha256sum * > checksums.txt
-        cat checksums.txt
+      - name: Checksums
+        run: |
+          cd artifacts
+          sha256sum * > checksums.txt
+          cat checksums.txt
 
-    - name: Get tag name
-      id: tag
-      run: echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      - name: Get tag
+        id: tag
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
-    - name: Create release notes
-      run: |
-        cat > release_notes.md << 'EOF'
-        ## Hours MCP - Professional Time Tracking & Invoice Generation
+      - name: Release notes
+        run: |
+          cat > release_notes.md << 'EOF'
+          ## Hours — Time tracking & invoicing
 
-        ### 🚀 Quick Start
+          ### macOS app
 
-        1. **Download** the binary for your platform below
-        2. **Install**: `chmod +x hours-mcp-* && mv hours-mcp-* ~/.local/bin/hours-mcp`
-        3. **Configure** Claude Desktop (see [README](https://github.com/aarlint/hours-mcp#configure-claude-desktop))
+          | Architecture | Download |
+          |---|---|
+          | Apple Silicon (M1/M2/M3) | `Hours-darwin-arm64.zip` |
+          | Intel | `Hours-darwin-amd64.zip` |
 
-        ### 📦 Platform Downloads
+          Unzip and drag **Hours.app** into `/Applications` (or `~/Applications`).
+          First launch: right-click → Open to bypass Gatekeeper for unsigned builds.
 
-        | Platform | Architecture | Download |
-        |----------|-------------|----------|
-        | **macOS** | Apple Silicon (M1/M2/M3) | `hours-mcp-darwin-arm64` |
-        | **macOS** | Intel | `hours-mcp-darwin-amd64` |
-        | **Linux** | x86_64 | `hours-mcp-linux-amd64` |
-        | **Linux** | ARM64 | `hours-mcp-linux-arm64` |
-        | **Windows** | x86_64 | `hours-mcp-windows-amd64.exe` |
+          The native app includes the full UI plus the MCP stdio server — point Claude Desktop at:
 
-        ### ✨ Features
-
-        - 🎯 **Contract-based billing** with individual rates per engagement
-        - 📄 **Professional PDF invoices** with business branding
-        - 👥 **Complete recipient management** (add, list, remove)
-        - ⏱️ **15-minute precision** time tracking with UUID entries
-        - 🗣️ **Natural language** time entry support
-        - 🏗️ **Professional database** with automatic migrations
-        - 💼 **Business information** configuration for invoices
-        - 🔒 **Local SQLite storage** - your data stays private
-
-        ### 🔐 Security
-
-        All binaries are built automatically by GitHub Actions and include checksums for verification.
-
-        ### 📚 Documentation
-
-        - [README](https://github.com/aarlint/hours-mcp/blob/main/README.md) - Complete setup and usage guide
-        - [Database Schema](https://github.com/aarlint/hours-mcp/blob/main/README.md#database-schema) - Entity relationships
-        - [Usage Examples](https://github.com/aarlint/hours-mcp/blob/main/README.md#usage-examples) - Common workflows
-
-        ### 🛠️ Claude Desktop Configuration
-
-        Add to your Claude Desktop config:
-
-        ```json
-        {
-          "mcpServers": {
-            "hours": {
-              "command": "/Users/YOUR_USERNAME/.local/bin/hours-mcp",
-              "args": [],
-              "env": {}
+          ```json
+          {
+            "mcpServers": {
+              "hours": {
+                "command": "/Applications/Hours.app/Contents/MacOS/Hours",
+                "args": ["--mcp"]
+              }
             }
           }
-        }
-        ```
+          ```
 
-        Then restart Claude Desktop and start tracking time professionally! 🚀
-        EOF
+          ### Stdio-only CLI (headless MCP)
 
-    - name: Create Release
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: ${{ steps.tag.outputs.tag }}
-        name: "Hours MCP ${{ steps.tag.outputs.tag }}"
-        body_path: release_notes.md
-        files: |
-          binaries/*
-        draft: false
-        prerelease: ${{ contains(steps.tag.outputs.tag, 'beta') || contains(steps.tag.outputs.tag, 'alpha') }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          Use these if you don't want the desktop UI.
+
+          | Platform | Download |
+          |---|---|
+          | macOS (Apple Silicon) | `hours-darwin-arm64` |
+          | macOS (Intel) | `hours-darwin-amd64` |
+          | Linux (x86_64) | `hours-linux-amd64` |
+          | Linux (ARM64) | `hours-linux-arm64` |
+          | Windows (x86_64) | `hours-windows-amd64.exe` |
+
+          ```bash
+          chmod +x hours-*
+          mv hours-* ~/.local/bin/hours
+          ```
+
+          Claude Desktop config:
+          ```json
+          {
+            "mcpServers": {
+              "hours": {
+                "command": "/Users/YOUR_USERNAME/.local/bin/hours"
+              }
+            }
+          }
+          ```
+
+          ### Documentation
+
+          - [README](https://github.com/aarlint/hours/blob/main/README.md)
+          EOF
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "Hours ${{ steps.tag.outputs.tag }}"
+          body_path: release_notes.md
+          files: artifacts/*
+          draft: false
+          prerelease: ${{ contains(steps.tag.outputs.tag, 'beta') || contains(steps.tag.outputs.tag, 'alpha') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

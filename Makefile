@@ -1,51 +1,74 @@
-.PHONY: build build-all install clean run test release
+.PHONY: build build-arm64 build-all install clean run test release deps app dev mcp-install
 
 VERSION ?= dev
+WAILS := $(shell go env GOPATH)/bin/wails
 
-# Build for current platform
+# ---- Headless / legacy builds (MCP stdio + --serve HTTP) ----
+
 build:
-	go build -ldflags="-s -w -X main.version=$(VERSION)" -o hours-mcp main.go
+	go build -ldflags="-s -w -X main.version=$(VERSION)" -o hours-mcp .
 
-# Build for Apple Silicon specifically
 build-arm64:
-	GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w -X main.version=$(VERSION)" -o hours-mcp main.go
+	GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w -X main.version=$(VERSION)" -o hours-mcp .
 
-# Build for all platforms
 build-all:
 	./scripts/build-all.sh $(VERSION)
 
-# Install to user's local bin
 install: build-arm64
 	mkdir -p ~/.local/bin
 	cp hours-mcp ~/.local/bin/
 	@echo "Installed to ~/.local/bin/hours-mcp"
-	@echo "Add the following to your Claude Desktop config:"
+
+# ---- Native Wails app bundle ----
+
+app:
+	cd internal/web && npm install && npm run build
+	$(WAILS) build -clean -platform darwin/arm64 -ldflags="-X main.version=$(VERSION)"
+	@echo ""
+	@echo "Built build/bin/Hours.app"
+	@echo "Drag it to /Applications, then point Claude Desktop at:"
+	@echo "  /Applications/Hours.app/Contents/MacOS/Hours --mcp"
+
+dev:
+	$(WAILS) dev
+
+# ---- MCP config helper ----
+
+INSTALL_DIR ?= $(HOME)/Applications
+
+mcp-install: app
+	@mkdir -p "$(INSTALL_DIR)"
+	@if [ -d "$(INSTALL_DIR)/Hours.app" ]; then \
+		echo "Hours.app already in $(INSTALL_DIR) — replacing"; \
+		rm -rf "$(INSTALL_DIR)/Hours.app"; \
+	fi
+	cp -R build/bin/Hours.app "$(INSTALL_DIR)/"
+	@echo ""
+	@echo "Installed to $(INSTALL_DIR)/Hours.app"
+	@echo ""
+	@echo "Claude Desktop config:"
 	@echo '  "hours": {'
-	@echo '    "command": "'$$HOME'/.local/bin/hours-mcp",'
-	@echo '    "args": [],'
-	@echo '    "env": {}'
+	@echo '    "command": "$(INSTALL_DIR)/Hours.app/Contents/MacOS/Hours",'
+	@echo '    "args": ["--mcp"]'
 	@echo '  }'
+	@echo ""
+	@echo "To install to /Applications instead: sudo make mcp-install INSTALL_DIR=/Applications"
 
-# Create a local release
+# ---- Misc ----
+
 release: build-all
-	@echo "Creating release archive..."
 	tar -czf hours-mcp-$(VERSION).tar.gz -C dist .
-	@echo "Release archive created: hours-mcp-$(VERSION).tar.gz"
 
-# Clean build artifacts
 clean:
 	rm -f hours-mcp hours-mcp-*.tar.gz
-	rm -rf dist/
+	rm -rf dist/ build/
 
-# Run locally for testing
 run:
-	go run main.go
+	go run . --serve
 
-# Run tests
 test:
 	go test ./...
 
-# Download dependencies
 deps:
 	go mod download
 	go mod tidy

@@ -43,3 +43,12 @@ hours-mcp-*
 # Temporary files
 *.tmp
 *.temp
+
+# Frontend build/generated
+internal/web/node_modules/
+internal/web/dist/
+internal/web/src/wailsjs/
+*.md5
+
+# Installer artifacts
+*.pkg

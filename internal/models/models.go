@@ -101,5 +101,6 @@ type BusinessInfo struct {
 	Website       string    `json:"website,omitempty"`
 	LogoPath      string    `json:"logo_path,omitempty"`
 	InvoicePrefix string    `json:"invoice_prefix,omitempty"`
+	ExportPath    string    `json:"export_path,omitempty"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }

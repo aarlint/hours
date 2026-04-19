@@ -15,7 +15,7 @@ GOOS=darwin GOARCH=arm64 go build -o hours-mcp main.go
 make install
 
 # Build and install to custom location
-GOOS=darwin GOARCH=arm64 go build -o /Users/austin/.local/bin/hours-mcp main.go
+GOOS=darwin GOARCH=arm64 go build -o ~/.local/bin/hours-mcp main.go
 ```
 
 ### Development and Testing
@@ -115,4 +115,4 @@ This is an MCP (Model Context Protocol) server for time tracking and invoice gen
 - SQLite driver requires CGO (uses `github.com/mattn/go-sqlite3`)
 - MCP protocol requires stdio transport for Claude Desktop integration
 - PDF generation depends on several image/PDF processing libraries
-- after making changes build and push to local bin /Users/austin/.local/bin/hours-mcp
+- after making changes build and push to local bin ~/.local/bin/hours-mcp

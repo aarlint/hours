@@ -138,6 +138,7 @@ func createTables(db *sql.DB) error {
 		website TEXT,
 		logo_path TEXT,
 		invoice_prefix TEXT DEFAULT 'INV',
+		export_path TEXT,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
@@ -217,6 +218,12 @@ func runMigrations(db *sql.DB) error {
 			name: "remove_rate_constraints_from_clients",
 			apply: func(db *sql.DB) error {
 				return removeRateConstraintsFromClients(db)
+			},
+		},
+		{
+			name: "add_export_path_to_business_info",
+			apply: func(db *sql.DB) error {
+				return addColumnIfNotExists(db, "business_info", "export_path", "TEXT")
 			},
 		},
 	}
