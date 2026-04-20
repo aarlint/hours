@@ -86,6 +86,38 @@ type Invoice struct {
 	Contracts   []Contract  `json:"contracts,omitempty"`
 }
 
+type QuoteLineItem struct {
+	ID          int     `json:"id"`
+	QuoteID     int     `json:"quote_id"`
+	Description string  `json:"description"`
+	Quantity    float64 `json:"quantity"`
+	Unit        string  `json:"unit"`
+	UnitPrice   float64 `json:"unit_price"`
+	Amount      float64 `json:"amount"`
+	SortOrder   int     `json:"sort_order"`
+}
+
+type Quote struct {
+	ID                  int        `json:"id"`
+	ClientID            int        `json:"client_id"`
+	QuoteNumber         string     `json:"quote_number"`
+	Title               string     `json:"title"`
+	IssueDate           time.Time  `json:"issue_date"`
+	ValidUntil          time.Time  `json:"valid_until"`
+	Subtotal            float64    `json:"subtotal"`
+	TotalAmount         float64    `json:"total_amount"`
+	Currency            string     `json:"currency"`
+	Status              string     `json:"status"`
+	Notes               string     `json:"notes,omitempty"`
+	PDFPath             string     `json:"pdf_path,omitempty"`
+	ConvertedContractID *int       `json:"converted_contract_id,omitempty"`
+	CreatedAt           time.Time  `json:"created_at"`
+	UpdatedAt           time.Time  `json:"updated_at"`
+
+	Client    *Client         `json:"client,omitempty"`
+	LineItems []QuoteLineItem `json:"line_items,omitempty"`
+}
+
 type BusinessInfo struct {
 	ID            int       `json:"id"`
 	BusinessName  string    `json:"business_name"`

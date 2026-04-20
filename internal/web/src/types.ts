@@ -88,6 +88,41 @@ export interface InvoiceDetails {
   total_hours: number
 }
 
+export interface QuoteLineItem {
+  id: number
+  quote_id: number
+  description: string
+  quantity: number
+  unit: string
+  unit_price: number
+  amount: number
+  sort_order: number
+}
+
+export interface Quote {
+  id: number
+  quote_number: string
+  client_id: number
+  client_name: string
+  title: string
+  issue_date: string
+  valid_until: string
+  subtotal: number
+  total_amount: number
+  currency: string
+  status: 'draft' | 'sent' | 'accepted' | 'rejected' | 'expired' | 'converted'
+  notes?: string
+  pdf_path?: string
+  converted_contract_id?: number | null
+  created_at: string
+  updated_at: string
+}
+
+export interface QuoteDetails {
+  quote: Quote
+  line_items: QuoteLineItem[]
+}
+
 export interface BusinessInfo {
   id: number
   business_name: string

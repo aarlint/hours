@@ -16,6 +16,10 @@ const meta = computed(() => {
     case 'paused':     return { label: 'Paused',     color: 'var(--ink-3)'    }
     case 'completed':  return { label: 'Completed',  color: 'var(--billable)' }
     case 'invoiced':   return { label: 'Invoiced',   color: 'var(--billable)' }
+    case 'accepted':   return { label: 'Accepted',   color: 'var(--billable)' }
+    case 'rejected':   return { label: 'Rejected',   color: 'var(--overdue)'  }
+    case 'expired':    return { label: 'Expired',    color: 'var(--overdue)'  }
+    case 'converted':  return { label: 'Converted',  color: 'var(--billable)' }
     default:           return { label: props.status, color: 'var(--ink-3)'    }
   }
 })

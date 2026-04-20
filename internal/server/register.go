@@ -20,6 +20,9 @@ import (
 func RegisterTools(server *mcp.Server, db *sql.DB) {
 	h := &Handler{db: db}
 
+	// Quoting tools live in quotes.go
+	defer RegisterQuoteTools(server, db, h)
+
 	// Add Client tool
 	type addClientArgs struct {
 		Name    string `json:"name" jsonschema:"Client name"`

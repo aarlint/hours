@@ -48,6 +48,18 @@ const routes: RouteRecordRaw[] = [
     meta: { label: 'INVOICE' },
   },
   {
+    path: '/quotes',
+    name: 'quotes',
+    component: () => import('./views/QuotesView.vue'),
+    meta: { label: 'QUOTES' },
+  },
+  {
+    path: '/quotes/:number',
+    name: 'quote-detail',
+    component: () => import('./views/QuoteDetailView.vue'),
+    meta: { label: 'QUOTE' },
+  },
+  {
     path: '/settings',
     name: 'settings',
     component: () => import('./views/SettingsView.vue'),

@@ -59,6 +59,7 @@ const showRightRail = computed(() => route.name === 'dashboard')
 const nav = [
   { to: '/dashboard', label: 'Dashboard' },
   { to: '/time', label: 'Time log' },
+  { to: '/quotes', label: 'Quotes' },
   { to: '/invoices', label: 'Invoices' },
   { to: '/clients', label: 'Clients' },
 ]

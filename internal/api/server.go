@@ -91,6 +91,16 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("DELETE /api/invoices/{number}", jsonHandler(h.deleteInvoice))
 	s.mux.HandleFunc("POST /api/invoices/{number}/download", jsonHandler(h.downloadInvoice))
 
+	// Quotes
+	s.mux.HandleFunc("GET /api/quotes", jsonHandler(h.listQuotes))
+	s.mux.HandleFunc("POST /api/quotes", jsonHandler(h.createQuote))
+	s.mux.HandleFunc("GET /api/quotes/{number}", jsonHandler(h.getQuoteDetails))
+	s.mux.HandleFunc("PUT /api/quotes/{number}", jsonHandler(h.updateQuote))
+	s.mux.HandleFunc("PATCH /api/quotes/{number}", jsonHandler(h.updateQuoteStatus))
+	s.mux.HandleFunc("DELETE /api/quotes/{number}", jsonHandler(h.deleteQuote))
+	s.mux.HandleFunc("POST /api/quotes/{number}/download", jsonHandler(h.downloadQuote))
+	s.mux.HandleFunc("POST /api/quotes/{number}/convert", jsonHandler(h.convertQuote))
+
 	// Static frontend (SPA fallback)
 	if s.assets != nil {
 		s.mux.HandleFunc("/", s.serveSPA)

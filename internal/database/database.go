@@ -123,6 +123,38 @@ func createTables(db *sql.DB) error {
 		FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
 	);
 
+	CREATE TABLE IF NOT EXISTS quotes (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		client_id INTEGER NOT NULL,
+		quote_number TEXT NOT NULL UNIQUE,
+		title TEXT NOT NULL,
+		issue_date DATE NOT NULL,
+		valid_until DATE NOT NULL,
+		subtotal REAL NOT NULL DEFAULT 0,
+		total_amount REAL NOT NULL DEFAULT 0,
+		currency TEXT DEFAULT 'USD',
+		status TEXT DEFAULT 'draft',
+		notes TEXT,
+		pdf_path TEXT,
+		converted_contract_id INTEGER,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE,
+		FOREIGN KEY (converted_contract_id) REFERENCES contracts(id)
+	);
+
+	CREATE TABLE IF NOT EXISTS quote_line_items (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		quote_id INTEGER NOT NULL,
+		description TEXT NOT NULL,
+		quantity REAL NOT NULL DEFAULT 1,
+		unit TEXT DEFAULT 'hours',
+		unit_price REAL NOT NULL DEFAULT 0,
+		amount REAL NOT NULL DEFAULT 0,
+		sort_order INTEGER DEFAULT 0,
+		FOREIGN KEY (quote_id) REFERENCES quotes(id) ON DELETE CASCADE
+	);
+
 	CREATE TABLE IF NOT EXISTS business_info (
 		id INTEGER PRIMARY KEY,
 		business_name TEXT NOT NULL,
@@ -149,6 +181,9 @@ func createTables(db *sql.DB) error {
 	CREATE INDEX IF NOT EXISTS idx_contracts_client ON contracts(client_id);
 	CREATE INDEX IF NOT EXISTS idx_contracts_status ON contracts(status);
 	CREATE INDEX IF NOT EXISTS idx_contracts_dates ON contracts(start_date, end_date);
+	CREATE INDEX IF NOT EXISTS idx_quotes_client ON quotes(client_id);
+	CREATE INDEX IF NOT EXISTS idx_quotes_status ON quotes(status);
+	CREATE INDEX IF NOT EXISTS idx_quote_line_items_quote ON quote_line_items(quote_id);
 	`
 
 	if _, err := db.Exec(schema); err != nil {

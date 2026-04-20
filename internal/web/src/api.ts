@@ -5,6 +5,9 @@ import type {
   Invoice,
   InvoiceDetails,
   PaymentDetails,
+  Quote,
+  QuoteDetails,
+  QuoteLineItem,
   Recipient,
   Stats,
   TimeEntry,
@@ -174,6 +177,83 @@ export const api = {
       'POST',
       `/api/invoices/${encodeURIComponent(number)}/download`,
     ),
+
+  // Quotes
+  listQuotes: (params?: { client_id?: number; status?: string }) => {
+    const q = new URLSearchParams()
+    if (params?.client_id) q.set('client_id', String(params.client_id))
+    if (params?.status) q.set('status', params.status)
+    const qs = q.toString()
+    return request<Quote[]>('GET', '/api/quotes' + (qs ? '?' + qs : ''))
+  },
+  getQuote: (number: string) =>
+    request<QuoteDetails>('GET', `/api/quotes/${encodeURIComponent(number)}`),
+  createQuote: (data: {
+    client_id: number
+    title: string
+    issue_date?: string
+    valid_until?: string
+    valid_days?: number
+    currency?: string
+    notes?: string
+    line_items: Array<Omit<Partial<QuoteLineItem>, 'id' | 'quote_id' | 'amount' | 'sort_order'> & {
+      description: string
+      quantity: number
+      unit_price: number
+    }>
+  }) => request<{ id: number; quote_number: string; total_amount: number }>('POST', '/api/quotes', data),
+  updateQuote: (
+    number: string,
+    data: {
+      title?: string
+      notes?: string
+      valid_until?: string
+      currency?: string
+      line_items?: Array<{
+        description: string
+        quantity: number
+        unit?: string
+        unit_price: number
+      }>
+    },
+  ) =>
+    request<{ quote_number: string }>(
+      'PUT',
+      `/api/quotes/${encodeURIComponent(number)}`,
+      data,
+    ),
+  updateQuoteStatus: (number: string, status: string) =>
+    request<{ status: string }>(
+      'PATCH',
+      `/api/quotes/${encodeURIComponent(number)}`,
+      { status },
+    ),
+  deleteQuote: (number: string) =>
+    request<{ deleted: string }>(
+      'DELETE',
+      `/api/quotes/${encodeURIComponent(number)}`,
+    ),
+  downloadQuote: (number: string) =>
+    request<{ quote_number: string; pdf_path: string; export_dir: string }>(
+      'POST',
+      `/api/quotes/${encodeURIComponent(number)}/download`,
+    ),
+  convertQuote: (
+    number: string,
+    data: {
+      contract_number: string
+      contract_name?: string
+      start_date?: string
+      end_date?: string
+      payment_terms?: string
+    },
+  ) =>
+    request<{
+      quote_number: string
+      contract_id: number
+      contract_number: string
+      hourly_rate: number
+    }>('POST', `/api/quotes/${encodeURIComponent(number)}/convert`, data),
 }
 
 export function formatCurrency(amount: number, currency = 'USD'): string {
