@@ -10,8 +10,13 @@ export type RealtimeKind =
   | 'invoice.deleted'
   | 'client.created'
   | 'client.updated'
+  | 'client.deleted'
   | 'contract.created'
   | 'contract.updated'
+  | 'quote.created'
+  | 'quote.updated'
+  | 'quote.deleted'
+  | 'quote.converted'
 
 export interface RealtimeEvent {
   kind: RealtimeKind
@@ -43,8 +48,13 @@ const KINDS: RealtimeKind[] = [
   'invoice.deleted',
   'client.created',
   'client.updated',
+  'client.deleted',
   'contract.created',
   'contract.updated',
+  'quote.created',
+  'quote.updated',
+  'quote.deleted',
+  'quote.converted',
 ]
 
 function dispatch(ev: RealtimeEvent) {

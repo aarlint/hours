@@ -59,6 +59,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/clients", jsonHandler(h.listClients))
 	s.mux.HandleFunc("POST /api/clients", jsonHandler(h.addClient))
 	s.mux.HandleFunc("PUT /api/clients/{id}", jsonHandler(h.editClient))
+	s.mux.HandleFunc("DELETE /api/clients/{id}", jsonHandler(h.deleteClient))
 
 	// Recipients
 	s.mux.HandleFunc("GET /api/clients/{id}/recipients", jsonHandler(h.listRecipients))

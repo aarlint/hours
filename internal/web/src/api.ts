@@ -72,6 +72,16 @@ export const api = {
     request<{ id: number; name: string }>('POST', '/api/clients', data),
   editClient: (id: number, data: Partial<Client>) =>
     request<{ id: number }>('PUT', `/api/clients/${id}`, data),
+  deleteClient: (id: number) =>
+    request<{
+      deleted: number
+      name: string
+      contracts: number
+      time_entries: number
+      invoices: number
+      quotes: number
+      recipients: number
+    }>('DELETE', `/api/clients/${id}`),
 
   // Recipients
   listRecipients: (clientId: number) =>

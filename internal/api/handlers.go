@@ -252,6 +252,56 @@ func (h *handlers) editClient(w http.ResponseWriter, r *http.Request) (interface
 	return map[string]interface{}{"id": id}, nil
 }
 
+func (h *handlers) deleteClient(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	id, err := pathInt(r, "id")
+	if err != nil {
+		return nil, err
+	}
+
+	var name string
+	err = h.db.QueryRow("SELECT name FROM clients WHERE id = ?", id).Scan(&name)
+	if err == sql.ErrNoRows {
+		return nil, newAPIError(http.StatusNotFound, "client not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Tally what will cascade so the caller and event listeners know.
+	var contracts, timeEntries, invoices, quotes, recipients int
+	_ = h.db.QueryRow("SELECT COUNT(*) FROM contracts WHERE client_id = ?", id).Scan(&contracts)
+	_ = h.db.QueryRow("SELECT COUNT(*) FROM time_entries WHERE client_id = ?", id).Scan(&timeEntries)
+	_ = h.db.QueryRow("SELECT COUNT(*) FROM invoices WHERE client_id = ?", id).Scan(&invoices)
+	_ = h.db.QueryRow("SELECT COUNT(*) FROM quotes WHERE client_id = ?", id).Scan(&quotes)
+	_ = h.db.QueryRow("SELECT COUNT(*) FROM recipients WHERE client_id = ?", id).Scan(&recipients)
+
+	// ON DELETE CASCADE wipes recipients, payment_details, contracts,
+	// time_entries, invoices, and quotes in one shot.
+	if _, err := h.db.Exec("DELETE FROM clients WHERE id = ?", id); err != nil {
+		return nil, err
+	}
+
+	BroadcastEvent("client.deleted", map[string]any{
+		"id":           id,
+		"name":         name,
+		"contracts":    contracts,
+		"time_entries": timeEntries,
+		"invoices":     invoices,
+		"quotes":       quotes,
+		"recipients":   recipients,
+	})
+
+	return map[string]interface{}{
+		"deleted":      id,
+		"name":         name,
+		"contracts":    contracts,
+		"time_entries": timeEntries,
+		"invoices":     invoices,
+		"quotes":       quotes,
+		"recipients":   recipients,
+	}, nil
+}
+
 // ---------- Recipients ----------
 
 type recipientDTO struct {

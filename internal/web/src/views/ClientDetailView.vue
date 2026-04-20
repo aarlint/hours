@@ -9,8 +9,10 @@ import Modal from '../components/Modal.vue'
 import StatusChip from '../components/StatusChip.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { useConfirm } from '../composables/useConfirm'
+import { useToasts } from '../composables/useToasts'
 
 const { confirm: confirmDialog, alert: alertDialog } = useConfirm()
+const toasts = useToasts()
 
 const route = useRoute()
 const router = useRouter()
@@ -107,6 +109,64 @@ async function removeRecipient(rid: number) {
   }
 }
 
+const deleting = ref(false)
+
+async function deleteClient() {
+  if (!client.value) return
+  const lines: string[] = []
+  if (contracts.value.length) lines.push(`${contracts.value.length} contract${contracts.value.length === 1 ? '' : 's'}`)
+  if (recipients.value.length) lines.push(`${recipients.value.length} recipient${recipients.value.length === 1 ? '' : 's'}`)
+  if (payment.value) lines.push('payment details')
+  const detail = lines.length
+    ? `This also removes: ${lines.join(', ')}, plus all time entries, invoices, and quotes for this client.`
+    : 'This also removes all time entries, invoices, and quotes for this client.'
+
+  const ok = await confirmDialog({
+    title: `Delete ${client.value.name}?`,
+    message: 'This cannot be undone.',
+    detail,
+    confirmLabel: 'Delete client',
+    cancelLabel: 'Cancel',
+    tone: 'danger',
+  })
+  if (!ok) return
+
+  deleting.value = true
+  try {
+    const res = await api.deleteClient(id.value)
+    toasts.push({
+      tone: 'success',
+      title: `Deleted ${res.name}`,
+      detail: summarizeCounts(res),
+    })
+    router.push('/clients')
+  } catch (e: any) {
+    await alertDialog({
+      title: 'Could not delete client',
+      message: e.message,
+      tone: 'warning',
+    })
+  } finally {
+    deleting.value = false
+  }
+}
+
+function summarizeCounts(r: {
+  contracts: number
+  time_entries: number
+  invoices: number
+  quotes: number
+  recipients: number
+}): string | undefined {
+  const bits: string[] = []
+  if (r.contracts) bits.push(`${r.contracts} contract${r.contracts === 1 ? '' : 's'}`)
+  if (r.time_entries) bits.push(`${r.time_entries} time ${r.time_entries === 1 ? 'entry' : 'entries'}`)
+  if (r.invoices) bits.push(`${r.invoices} invoice${r.invoices === 1 ? '' : 's'}`)
+  if (r.quotes) bits.push(`${r.quotes} quote${r.quotes === 1 ? '' : 's'}`)
+  if (r.recipients) bits.push(`${r.recipients} recipient${r.recipients === 1 ? '' : 's'}`)
+  return bits.length ? `Also removed: ${bits.join(', ')}` : undefined
+}
+
 async function savePayment() {
   paymentSaving.value = true
   paymentMsg.value = ''
@@ -148,6 +208,9 @@ onMounted(load)
       <template #actions>
         <RouterLink to="/clients" class="btn btn-ghost">← BACK</RouterLink>
         <button class="btn btn-secondary" @click="openEdit">EDIT</button>
+        <button class="btn btn-ghost btn-danger" :disabled="deleting" @click="deleteClient">
+          {{ deleting ? 'DELETING...' : 'DELETE' }}
+        </button>
       </template>
     </PageHeader>
 
