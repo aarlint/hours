@@ -155,6 +155,20 @@ func createTables(db *sql.DB) error {
 		FOREIGN KEY (quote_id) REFERENCES quotes(id) ON DELETE CASCADE
 	);
 
+	CREATE TABLE IF NOT EXISTS payment_methods (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		label TEXT NOT NULL,
+		bank_name TEXT,
+		account_number TEXT,
+		routing_number TEXT,
+		swift_code TEXT,
+		payment_terms TEXT,
+		notes TEXT,
+		is_default BOOLEAN DEFAULT FALSE,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
 	CREATE TABLE IF NOT EXISTS business_info (
 		id INTEGER PRIMARY KEY,
 		business_name TEXT NOT NULL,
@@ -259,6 +273,24 @@ func runMigrations(db *sql.DB) error {
 			name: "add_export_path_to_business_info",
 			apply: func(db *sql.DB) error {
 				return addColumnIfNotExists(db, "business_info", "export_path", "TEXT")
+			},
+		},
+		{
+			name: "add_payment_method_to_contracts",
+			apply: func(db *sql.DB) error {
+				return addColumnIfNotExists(db, "contracts", "payment_method_id", "INTEGER")
+			},
+		},
+		{
+			name: "add_payment_method_to_invoices",
+			apply: func(db *sql.DB) error {
+				return addColumnIfNotExists(db, "invoices", "payment_method_id", "INTEGER")
+			},
+		},
+		{
+			name: "migrate_payment_details_to_payment_methods",
+			apply: func(db *sql.DB) error {
+				return migratePaymentDetailsToMethods(db)
 			},
 		},
 	}
@@ -496,4 +528,93 @@ func removeRateConstraintsFromClients(db *sql.DB) error {
 
 	fmt.Println("Successfully removed rate constraints from clients table")
 	return nil
+}
+
+// migratePaymentDetailsToMethods lifts every legacy per-client payment_details
+// row into a business-level payment_methods entry and points each contract
+// belonging to that client at the new method. Existing invoices keep their
+// data flow (they read through contracts now) so nothing on disk changes.
+//
+// Labels use the client name so the user can immediately recognise methods
+// in the Settings UI and rename/consolidate them there.
+func migratePaymentDetailsToMethods(db *sql.DB) error {
+	// Nothing to do unless the legacy table exists.
+	var tblName string
+	err := db.QueryRow(
+		`SELECT name FROM sqlite_master WHERE type='table' AND name='payment_details'`,
+	).Scan(&tblName)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("check legacy payment_details: %w", err)
+	}
+
+	rows, err := db.Query(`
+		SELECT pd.client_id, c.name,
+		       COALESCE(pd.bank_name,''), COALESCE(pd.account_number,''),
+		       COALESCE(pd.routing_number,''), COALESCE(pd.swift_code,''),
+		       COALESCE(pd.payment_terms,''), COALESCE(pd.notes,'')
+		FROM payment_details pd
+		JOIN clients c ON c.id = pd.client_id
+	`)
+	if err != nil {
+		return fmt.Errorf("scan legacy payment_details: %w", err)
+	}
+	defer rows.Close()
+
+	type legacy struct {
+		clientID                                        int
+		clientName, bank, acct, routing, swift, terms, notes string
+	}
+	var batch []legacy
+	for rows.Next() {
+		var l legacy
+		if err := rows.Scan(&l.clientID, &l.clientName, &l.bank, &l.acct, &l.routing,
+			&l.swift, &l.terms, &l.notes); err != nil {
+			return err
+		}
+		batch = append(batch, l)
+	}
+	if len(batch) == 0 {
+		return nil
+	}
+
+	fmt.Printf("Migrating %d legacy per-client payment_details into business-level payment_methods...\n", len(batch))
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for i, l := range batch {
+		label := fmt.Sprintf("%s (migrated)", l.clientName)
+		isDefault := i == 0 // first one becomes the default method
+		var methodID int64
+		if err := tx.QueryRow(`
+			INSERT INTO payment_methods (label, bank_name, account_number, routing_number,
+			                             swift_code, payment_terms, notes, is_default)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			RETURNING id
+		`, label, l.bank, l.acct, l.routing, l.swift, l.terms, l.notes, isDefault).Scan(&methodID); err != nil {
+			return fmt.Errorf("insert payment_method for %s: %w", l.clientName, err)
+		}
+		if _, err := tx.Exec(`
+			UPDATE contracts SET payment_method_id = ?
+			WHERE client_id = ? AND payment_method_id IS NULL
+		`, methodID, l.clientID); err != nil {
+			return fmt.Errorf("attach payment_method to contracts for %s: %w", l.clientName, err)
+		}
+		// Snapshot the same method onto any past invoices so the PDF
+		// regenerate path keeps working identically.
+		if _, err := tx.Exec(`
+			UPDATE invoices SET payment_method_id = ?
+			WHERE client_id = ? AND payment_method_id IS NULL
+		`, methodID, l.clientID); err != nil {
+			return fmt.Errorf("attach payment_method to invoices for %s: %w", l.clientName, err)
+		}
+	}
+
+	return tx.Commit()
 }

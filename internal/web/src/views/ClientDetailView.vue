@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { api, formatCurrency } from '../api'
-import type { Client, Contract, PaymentDetails, Recipient } from '../types'
+import type { Client, Contract, Recipient } from '../types'
 import PageHeader from '../components/PageHeader.vue'
 import LoadingBar from '../components/LoadingBar.vue'
 import Modal from '../components/Modal.vue'
@@ -23,9 +23,8 @@ const error = ref<string | null>(null)
 const client = ref<Client | null>(null)
 const contracts = ref<Contract[]>([])
 const recipients = ref<Recipient[]>([])
-const payment = ref<PaymentDetails | null>(null)
 
-const tab = ref<'contracts' | 'recipients' | 'payment'>('contracts')
+const tab = ref<'contracts' | 'recipients'>('contracts')
 
 const editOpen = ref(false)
 const editForm = reactive<Partial<Client>>({})
@@ -33,18 +32,13 @@ const editForm = reactive<Partial<Client>>({})
 const recipientModal = ref(false)
 const recipientForm = reactive({ name: '', email: '', title: '', phone: '', is_primary: false })
 
-const paymentForm = reactive<Partial<PaymentDetails>>({})
-const paymentSaving = ref(false)
-const paymentMsg = ref('')
-
 async function load() {
   loading.value = true
   try {
-    const [clients, cs, rs, p] = await Promise.all([
+    const [clients, cs, rs] = await Promise.all([
       api.listClients(),
       api.listContracts({ client_id: id.value }),
       api.listRecipients(id.value),
-      api.getPaymentDetails(id.value),
     ])
     client.value = clients.find((c) => c.id === id.value) || null
     if (!client.value) {
@@ -53,8 +47,6 @@ async function load() {
     }
     contracts.value = cs
     recipients.value = rs
-    payment.value = p
-    Object.assign(paymentForm, p || {})
   } catch (e: any) {
     error.value = e.message
   } finally {
@@ -116,7 +108,6 @@ async function deleteClient() {
   const lines: string[] = []
   if (contracts.value.length) lines.push(`${contracts.value.length} contract${contracts.value.length === 1 ? '' : 's'}`)
   if (recipients.value.length) lines.push(`${recipients.value.length} recipient${recipients.value.length === 1 ? '' : 's'}`)
-  if (payment.value) lines.push('payment details')
   const detail = lines.length
     ? `This also removes: ${lines.join(', ')}, plus all time entries, invoices, and quotes for this client.`
     : 'This also removes all time entries, invoices, and quotes for this client.'
@@ -167,20 +158,6 @@ function summarizeCounts(r: {
   return bits.length ? `Also removed: ${bits.join(', ')}` : undefined
 }
 
-async function savePayment() {
-  paymentSaving.value = true
-  paymentMsg.value = ''
-  try {
-    await api.setPaymentDetails(id.value, paymentForm)
-    paymentMsg.value = 'SAVED'
-    await load()
-  } catch (e: any) {
-    paymentMsg.value = 'ERROR: ' + e.message
-  } finally {
-    paymentSaving.value = false
-  }
-}
-
 onMounted(load)
 </script>
 
@@ -221,7 +198,15 @@ onMounted(load)
       <button :class="{ active: tab === 'recipients' }" @click="tab = 'recipients'">
         RECIPIENTS ({{ recipients.length }})
       </button>
-      <button :class="{ active: tab === 'payment' }" @click="tab = 'payment'">PAYMENT</button>
+    </div>
+
+    <div class="settings-hint">
+      <span class="mono-label text-disabled">PAYMENT</span>
+      <span class="hint-body">
+        Payment methods are business-level — manage them in
+        <RouterLink to="/settings" class="mini-link">SETTINGS → PAYMENT METHODS</RouterLink>
+        and attach them per-contract.
+      </span>
     </div>
 
     <!-- Contracts tab -->
@@ -289,47 +274,6 @@ onMounted(load)
           </tr>
         </tbody>
       </table>
-    </section>
-
-    <!-- Payment tab -->
-    <section v-if="tab === 'payment'">
-      <div class="section-head">
-        <span class="mono-label">PAYMENT DETAILS</span>
-        <span v-if="paymentMsg" class="mono-label" :class="paymentMsg === 'SAVED' ? 'text-success' : 'text-accent'">
-          [ {{ paymentMsg }} ]
-        </span>
-      </div>
-      <form class="payment-form card-outlined" @submit.prevent="savePayment">
-        <div class="field">
-          <label>BANK NAME</label>
-          <input v-model="paymentForm.bank_name" class="input" />
-        </div>
-        <div class="field">
-          <label>ACCOUNT NUMBER</label>
-          <input v-model="paymentForm.account_number" class="input" />
-        </div>
-        <div class="field">
-          <label>ROUTING NUMBER</label>
-          <input v-model="paymentForm.routing_number" class="input" />
-        </div>
-        <div class="field">
-          <label>SWIFT CODE</label>
-          <input v-model="paymentForm.swift_code" class="input" />
-        </div>
-        <div class="field">
-          <label>PAYMENT TERMS</label>
-          <input v-model="paymentForm.payment_terms" class="input" placeholder="e.g. NET 30" />
-        </div>
-        <div class="field full">
-          <label>NOTES</label>
-          <textarea v-model="paymentForm.notes" class="textarea" rows="3" />
-        </div>
-        <div class="full" style="display: flex; justify-content: flex-end">
-          <button class="btn btn-primary" type="submit" :disabled="paymentSaving">
-            {{ paymentSaving ? 'SAVING...' : 'SAVE' }}
-          </button>
-        </div>
-      </form>
     </section>
 
     <!-- Edit client modal -->
@@ -422,16 +366,6 @@ onMounted(load)
   align-items: flex-end;
 }
 
-.payment-form {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: var(--space-md);
-}
-
-.payment-form .full {
-  grid-column: 1 / -1;
-}
-
 .checkbox-row {
   display: flex;
   align-items: center;
@@ -439,9 +373,26 @@ onMounted(load)
   cursor: pointer;
 }
 
-@media (max-width: 700px) {
-  .payment-form {
-    grid-template-columns: 1fr;
-  }
+.settings-hint {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  padding: var(--space-sm) var(--space-md);
+  margin-bottom: var(--space-lg);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+}
+
+.hint-body {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.mini-link {
+  color: var(--text-primary);
+}
+
+.mini-link:hover {
+  color: var(--accent, var(--text-primary));
 }
 </style>

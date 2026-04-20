@@ -17,20 +17,21 @@ type Client struct {
 }
 
 type Contract struct {
-	ID             int        `json:"id"`
-	ClientID       int        `json:"client_id"`
-	ContractNumber string     `json:"contract_number"`
-	Name           string     `json:"name"`
-	HourlyRate     float64    `json:"hourly_rate"`
-	Currency       string     `json:"currency"`
-	ContractType   string     `json:"contract_type"`
-	StartDate      time.Time  `json:"start_date"`
-	EndDate        *time.Time `json:"end_date,omitempty"`
-	Status         string     `json:"status"`
-	PaymentTerms   string     `json:"payment_terms,omitempty"`
-	Notes          string     `json:"notes,omitempty"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	ID              int        `json:"id"`
+	ClientID        int        `json:"client_id"`
+	ContractNumber  string     `json:"contract_number"`
+	Name            string     `json:"name"`
+	HourlyRate      float64    `json:"hourly_rate"`
+	Currency        string     `json:"currency"`
+	ContractType    string     `json:"contract_type"`
+	StartDate       time.Time  `json:"start_date"`
+	EndDate         *time.Time `json:"end_date,omitempty"`
+	Status          string     `json:"status"`
+	PaymentTerms    string     `json:"payment_terms,omitempty"`
+	PaymentMethodID *int       `json:"payment_method_id,omitempty"`
+	Notes           string     `json:"notes,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 
 	Client *Client `json:"client,omitempty"`
 }
@@ -55,6 +56,23 @@ type PaymentDetails struct {
 	SwiftCode     string    `json:"swift_code,omitempty"`
 	PaymentTerms  string    `json:"payment_terms,omitempty"`
 	Notes         string    `json:"notes,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+// PaymentMethod is a business-level saved payment method (e.g. a bank
+// account, Stripe link). Contracts opt into one; the chosen method
+// snapshots onto each invoice generated from that contract.
+type PaymentMethod struct {
+	ID            int       `json:"id"`
+	Label         string    `json:"label"`
+	BankName      string    `json:"bank_name,omitempty"`
+	AccountNumber string    `json:"account_number,omitempty"`
+	RoutingNumber string    `json:"routing_number,omitempty"`
+	SwiftCode     string    `json:"swift_code,omitempty"`
+	PaymentTerms  string    `json:"payment_terms,omitempty"`
+	Notes         string    `json:"notes,omitempty"`
+	IsDefault     bool      `json:"is_default"`
+	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 

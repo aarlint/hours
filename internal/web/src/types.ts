@@ -24,6 +24,7 @@ export interface Contract {
   end_date?: string | null
   status: string
   payment_terms?: string
+  payment_method_id?: number | null
   notes?: string
   created_at: string
   updated_at: string
@@ -49,6 +50,31 @@ export interface PaymentDetails {
   payment_terms?: string
   notes?: string
   updated_at: string
+}
+
+export interface PaymentMethod {
+  id: number
+  label: string
+  bank_name?: string
+  account_number?: string
+  routing_number?: string
+  swift_code?: string
+  payment_terms?: string
+  notes?: string
+  is_default: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface PaymentMethodInput {
+  label: string
+  bank_name?: string
+  account_number?: string
+  routing_number?: string
+  swift_code?: string
+  payment_terms?: string
+  notes?: string
+  is_default?: boolean
 }
 
 export interface TimeEntry {

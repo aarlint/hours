@@ -66,13 +66,21 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/clients/{id}/recipients", jsonHandler(h.addRecipient))
 	s.mux.HandleFunc("DELETE /api/recipients/{id}", jsonHandler(h.removeRecipient))
 
-	// Payment details
+	// Payment details (legacy per-client — kept for backward-compat;
+	// new UI uses business-level /api/payment-methods below).
 	s.mux.HandleFunc("GET /api/clients/{id}/payment-details", jsonHandler(h.getPaymentDetails))
 	s.mux.HandleFunc("PUT /api/clients/{id}/payment-details", jsonHandler(h.setPaymentDetails))
+
+	// Payment methods (business-level — attached to contracts)
+	s.mux.HandleFunc("GET /api/payment-methods", jsonHandler(h.listPaymentMethods))
+	s.mux.HandleFunc("POST /api/payment-methods", jsonHandler(h.addPaymentMethod))
+	s.mux.HandleFunc("PUT /api/payment-methods/{id}", jsonHandler(h.updatePaymentMethod))
+	s.mux.HandleFunc("DELETE /api/payment-methods/{id}", jsonHandler(h.deletePaymentMethod))
 
 	// Contracts
 	s.mux.HandleFunc("GET /api/contracts", jsonHandler(h.listContracts))
 	s.mux.HandleFunc("POST /api/contracts", jsonHandler(h.addContract))
+	s.mux.HandleFunc("PUT /api/contracts/{id}", jsonHandler(h.editContract))
 
 	// Time entries
 	s.mux.HandleFunc("GET /api/time-entries", jsonHandler(h.searchTimeEntries))

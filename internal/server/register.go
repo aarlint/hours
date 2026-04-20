@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/austin/hours-mcp/internal/api"
 	"github.com/austin/hours-mcp/internal/models"
 	"github.com/austin/hours-mcp/internal/pdf"
 	"github.com/austin/hours-mcp/internal/timeparse"
@@ -736,14 +737,9 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 			return nil, nil, fmt.Errorf("failed to check business info: %w", err)
 		}
 
-		// Validate payment details exist for client
-		var paymentBankName string
-		err = db.QueryRow("SELECT bank_name FROM payment_details WHERE client_id = ?", clientID).Scan(&paymentBankName)
-		if err == sql.ErrNoRows {
-			return nil, nil, fmt.Errorf("payment details not configured for client '%s'. Please use 'set_payment_details' to configure payment information before creating invoices", args.ClientName)
-		} else if err != nil {
-			return nil, nil, fmt.Errorf("failed to check payment details: %w", err)
-		}
+		// Payment info is now optional — snapshotted from the contract
+		// below, with a legacy per-client fallback. The PDF layer handles
+		// the empty case gracefully.
 
 		startDate, endDate, err := timeparse.ParsePeriod(args.Period)
 		if err != nil {
@@ -799,10 +795,19 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 		}
 		defer tx.Rollback()
 
+		// Snapshot the client's contract payment method onto this invoice.
+		var paymentMethodID sql.NullInt64
+		_ = db.QueryRow(`
+			SELECT payment_method_id FROM contracts
+			WHERE client_id = ? AND payment_method_id IS NOT NULL
+			ORDER BY (status = 'active') DESC, id
+			LIMIT 1
+		`, clientID).Scan(&paymentMethodID)
+
 		result, err := tx.Exec(`
-			INSERT INTO invoices (client_id, invoice_number, issue_date, due_date, total_amount, status)
-			VALUES (?, ?, ?, ?, ?, 'pending')
-		`, clientID, invoiceNumber, issueDate.Format("2006-01-02"), dueDate.Format("2006-01-02"), totalAmount)
+			INSERT INTO invoices (client_id, invoice_number, issue_date, due_date, total_amount, status, payment_method_id)
+			VALUES (?, ?, ?, ?, ?, 'pending', ?)
+		`, clientID, invoiceNumber, issueDate.Format("2006-01-02"), dueDate.Format("2006-01-02"), totalAmount, paymentMethodID)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to create invoice: %w", err)
 		}
@@ -821,13 +826,7 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 			TimeEntries:   entries,
 		}
 
-		var paymentDetails models.PaymentDetails
-		db.QueryRow(`
-			SELECT bank_name, account_number, routing_number, swift_code, payment_terms, notes
-			FROM payment_details WHERE client_id = ?
-		`, clientID).Scan(&paymentDetails.BankName, &paymentDetails.AccountNumber,
-			&paymentDetails.RoutingNumber, &paymentDetails.SwiftCode,
-			&paymentDetails.PaymentTerms, &paymentDetails.Notes)
+		paymentDetails := api.ResolveInvoicePaymentDetails(db, invoiceID, clientID)
 
 		var recipients []models.Recipient
 		recipientRows, err := db.Query(`

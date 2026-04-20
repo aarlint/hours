@@ -456,7 +456,8 @@ func (h *handlers) setPaymentDetails(w http.ResponseWriter, r *http.Request) (in
 func (h *handlers) listContracts(w http.ResponseWriter, r *http.Request) (interface{}, error) {
 	q := `
 		SELECT c.id, c.client_id, c.contract_number, c.name, c.hourly_rate, c.currency, c.contract_type,
-		       c.start_date, c.end_date, c.status, COALESCE(c.payment_terms,''), COALESCE(c.notes,''),
+		       c.start_date, c.end_date, c.status, COALESCE(c.payment_terms,''), c.payment_method_id,
+		       COALESCE(c.notes,''),
 		       c.created_at, c.updated_at, cl.name
 		FROM contracts c
 		JOIN clients cl ON c.client_id = cl.id
@@ -481,8 +482,9 @@ func (h *handlers) listContracts(w http.ResponseWriter, r *http.Request) (interf
 	for rows.Next() {
 		var c contractDTO
 		var endDate sql.NullString
+		var paymentMethodID sql.NullInt64
 		if err := rows.Scan(&c.ID, &c.ClientID, &c.ContractNumber, &c.Name, &c.HourlyRate, &c.Currency,
-			&c.ContractType, &c.StartDate, &endDate, &c.Status, &c.PaymentTerms, &c.Notes,
+			&c.ContractType, &c.StartDate, &endDate, &c.Status, &c.PaymentTerms, &paymentMethodID, &c.Notes,
 			&c.CreatedAt, &c.UpdatedAt, &c.ClientName); err != nil {
 			return nil, err
 		}
@@ -490,23 +492,28 @@ func (h *handlers) listContracts(w http.ResponseWriter, r *http.Request) (interf
 			t, _ := time.Parse("2006-01-02", endDate.String)
 			c.EndDate = &t
 		}
+		if paymentMethodID.Valid {
+			v := int(paymentMethodID.Int64)
+			c.PaymentMethodID = &v
+		}
 		out = append(out, c)
 	}
 	return out, nil
 }
 
 type addContractReq struct {
-	ClientID       int     `json:"client_id"`
-	ContractNumber string  `json:"contract_number"`
-	Name           string  `json:"name"`
-	HourlyRate     float64 `json:"hourly_rate"`
-	Currency       string  `json:"currency,omitempty"`
-	ContractType   string  `json:"contract_type,omitempty"`
-	StartDate      string  `json:"start_date"`
-	EndDate        string  `json:"end_date,omitempty"`
-	PaymentTerms   string  `json:"payment_terms,omitempty"`
-	Notes          string  `json:"notes,omitempty"`
-	Status         string  `json:"status,omitempty"`
+	ClientID        int     `json:"client_id"`
+	ContractNumber  string  `json:"contract_number"`
+	Name            string  `json:"name"`
+	HourlyRate      float64 `json:"hourly_rate"`
+	Currency        string  `json:"currency,omitempty"`
+	ContractType    string  `json:"contract_type,omitempty"`
+	StartDate       string  `json:"start_date"`
+	EndDate         string  `json:"end_date,omitempty"`
+	PaymentTerms    string  `json:"payment_terms,omitempty"`
+	PaymentMethodID *int    `json:"payment_method_id,omitempty"`
+	Notes           string  `json:"notes,omitempty"`
+	Status          string  `json:"status,omitempty"`
 }
 
 func (h *handlers) addContract(w http.ResponseWriter, r *http.Request) (interface{}, error) {
@@ -538,17 +545,109 @@ func (h *handlers) addContract(w http.ResponseWriter, r *http.Request) (interfac
 		}
 		endPtr = end.Format("2006-01-02")
 	}
+	var methodPtr interface{}
+	if req.PaymentMethodID != nil {
+		methodPtr = *req.PaymentMethodID
+	}
+
 	var id int64
 	err = h.db.QueryRow(`
 		INSERT INTO contracts (client_id, contract_number, name, hourly_rate, currency, contract_type,
-		                      start_date, end_date, status, payment_terms, notes)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		                      start_date, end_date, status, payment_terms, payment_method_id, notes)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		RETURNING id
 	`, req.ClientID, req.ContractNumber, req.Name, req.HourlyRate, req.Currency, req.ContractType,
-		start.Format("2006-01-02"), endPtr, req.Status, req.PaymentTerms, req.Notes).Scan(&id)
+		start.Format("2006-01-02"), endPtr, req.Status, req.PaymentTerms, methodPtr, req.Notes).Scan(&id)
 	if err != nil {
 		return nil, err
 	}
+	return map[string]interface{}{"id": id}, nil
+}
+
+type editContractReq struct {
+	Name            *string  `json:"name,omitempty"`
+	HourlyRate      *float64 `json:"hourly_rate,omitempty"`
+	Currency        *string  `json:"currency,omitempty"`
+	ContractType    *string  `json:"contract_type,omitempty"`
+	EndDate         *string  `json:"end_date,omitempty"`
+	Status          *string  `json:"status,omitempty"`
+	PaymentTerms    *string  `json:"payment_terms,omitempty"`
+	PaymentMethodID *int     `json:"payment_method_id,omitempty"`
+	ClearPaymentMethod bool  `json:"clear_payment_method,omitempty"`
+	Notes           *string  `json:"notes,omitempty"`
+}
+
+func (h *handlers) editContract(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	id, err := pathInt(r, "id")
+	if err != nil {
+		return nil, err
+	}
+	var req editContractReq
+	if err := decodeBody(r, &req); err != nil {
+		return nil, err
+	}
+	sets := []string{}
+	args := []interface{}{}
+	if req.Name != nil {
+		sets = append(sets, "name = ?")
+		args = append(args, *req.Name)
+	}
+	if req.HourlyRate != nil {
+		sets = append(sets, "hourly_rate = ?")
+		args = append(args, *req.HourlyRate)
+	}
+	if req.Currency != nil {
+		sets = append(sets, "currency = ?")
+		args = append(args, *req.Currency)
+	}
+	if req.ContractType != nil {
+		sets = append(sets, "contract_type = ?")
+		args = append(args, *req.ContractType)
+	}
+	if req.EndDate != nil {
+		if *req.EndDate == "" {
+			sets = append(sets, "end_date = NULL")
+		} else {
+			if _, err := time.Parse("2006-01-02", *req.EndDate); err != nil {
+				return nil, newAPIError(http.StatusBadRequest, "invalid end_date")
+			}
+			sets = append(sets, "end_date = ?")
+			args = append(args, *req.EndDate)
+		}
+	}
+	if req.Status != nil {
+		sets = append(sets, "status = ?")
+		args = append(args, *req.Status)
+	}
+	if req.PaymentTerms != nil {
+		sets = append(sets, "payment_terms = ?")
+		args = append(args, *req.PaymentTerms)
+	}
+	if req.ClearPaymentMethod {
+		sets = append(sets, "payment_method_id = NULL")
+	} else if req.PaymentMethodID != nil {
+		sets = append(sets, "payment_method_id = ?")
+		args = append(args, *req.PaymentMethodID)
+	}
+	if req.Notes != nil {
+		sets = append(sets, "notes = ?")
+		args = append(args, *req.Notes)
+	}
+	if len(sets) == 0 {
+		return nil, newAPIError(http.StatusBadRequest, "no fields provided")
+	}
+	sets = append(sets, "updated_at = CURRENT_TIMESTAMP")
+	args = append(args, id)
+	q := fmt.Sprintf("UPDATE contracts SET %s WHERE id = ?", strings.Join(sets, ", "))
+	res, err := h.db.Exec(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return nil, newAPIError(http.StatusNotFound, "contract not found")
+	}
+	BroadcastEvent("contract.updated", map[string]any{"id": id})
 	return map[string]interface{}{"id": id}, nil
 }
 
@@ -1014,15 +1113,10 @@ func (h *handlers) createInvoice(w http.ResponseWriter, r *http.Request) (interf
 		return nil, err
 	}
 
-	// Payment details validation
-	var paymentBank string
-	err = h.db.QueryRow(`SELECT COALESCE(bank_name,'') FROM payment_details WHERE client_id = ?`, req.ClientID).Scan(&paymentBank)
-	if err == sql.ErrNoRows {
-		return nil, newAPIError(http.StatusPreconditionFailed, "payment details not configured for client")
-	}
-	if err != nil {
-		return nil, err
-	}
+	// Payment info is now optional at invoice-create time: it's snapshotted
+	// from the client's contract below, and the PDF block is simply omitted
+	// if nothing's configured. Users can always attach/adjust a payment
+	// method post-hoc in Settings without re-issuing invoices.
 
 	var startDate, endDate time.Time
 	if req.StartDate != "" && req.EndDate != "" {
@@ -1104,10 +1198,15 @@ func (h *handlers) createInvoice(w http.ResponseWriter, r *http.Request) (interf
 	}
 	defer tx.Rollback()
 
+	// Snapshot the payment method from the client's contract so the invoice
+	// stays stable even if the contract's method changes later.
+	paymentMethodID := resolveContractPaymentMethodID(h.db, req.ClientID)
+
 	res, err := tx.Exec(`
-		INSERT INTO invoices (client_id, invoice_number, issue_date, due_date, total_amount, status)
-		VALUES (?, ?, ?, ?, ?, 'pending')
-	`, req.ClientID, invoiceNumber, issueDate.Format("2006-01-02"), dueDate.Format("2006-01-02"), totalAmount)
+		INSERT INTO invoices (client_id, invoice_number, issue_date, due_date, total_amount, status, payment_method_id)
+		VALUES (?, ?, ?, ?, ?, 'pending', ?)
+	`, req.ClientID, invoiceNumber, issueDate.Format("2006-01-02"), dueDate.Format("2006-01-02"), totalAmount,
+		paymentMethodID)
 	if err != nil {
 		return nil, err
 	}
@@ -1119,15 +1218,9 @@ func (h *handlers) createInvoice(w http.ResponseWriter, r *http.Request) (interf
 		}
 	}
 
-	// Gather info for PDF
-	var paymentDetails models.PaymentDetails
-	tx.QueryRow(`
-		SELECT COALESCE(bank_name,''), COALESCE(account_number,''), COALESCE(routing_number,''),
-		       COALESCE(swift_code,''), COALESCE(payment_terms,''), COALESCE(notes,'')
-		FROM payment_details WHERE client_id = ?
-	`, req.ClientID).Scan(&paymentDetails.BankName, &paymentDetails.AccountNumber,
-		&paymentDetails.RoutingNumber, &paymentDetails.SwiftCode,
-		&paymentDetails.PaymentTerms, &paymentDetails.Notes)
+	// Gather info for PDF. We read payment through the helper so the
+	// snapshot on this just-inserted invoice wins over legacy data.
+	paymentDetails := ResolveInvoicePaymentDetails(h.db, invoiceID, req.ClientID)
 
 	var recipients []models.Recipient
 	recRows, _ := tx.Query(`
@@ -1439,14 +1532,7 @@ func (h *handlers) downloadInvoice(w http.ResponseWriter, r *http.Request) (inte
 		entries = append(entries, e)
 	}
 
-	var paymentDetails models.PaymentDetails
-	h.db.QueryRow(`
-		SELECT COALESCE(bank_name,''), COALESCE(account_number,''), COALESCE(routing_number,''),
-		       COALESCE(swift_code,''), COALESCE(payment_terms,''), COALESCE(notes,'')
-		FROM payment_details WHERE client_id = ?
-	`, inv.ClientID).Scan(&paymentDetails.BankName, &paymentDetails.AccountNumber,
-		&paymentDetails.RoutingNumber, &paymentDetails.SwiftCode,
-		&paymentDetails.PaymentTerms, &paymentDetails.Notes)
+	paymentDetails := ResolveInvoicePaymentDetails(h.db, inv.ID, inv.ClientID)
 
 	var recipients []models.Recipient
 	recRows, _ := h.db.Query(`

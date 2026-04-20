@@ -5,6 +5,8 @@ import type {
   Invoice,
   InvoiceDetails,
   PaymentDetails,
+  PaymentMethod,
+  PaymentMethodInput,
   Quote,
   QuoteDetails,
   QuoteLineItem,
@@ -91,11 +93,25 @@ export const api = {
   removeRecipient: (id: number) =>
     request<{ deleted: number }>('DELETE', `/api/recipients/${id}`),
 
-  // Payment
+  // Payment (legacy per-client — kept for backward compat with existing data)
   getPaymentDetails: (clientId: number) =>
     request<PaymentDetails | null>('GET', `/api/clients/${clientId}/payment-details`),
   setPaymentDetails: (clientId: number, data: Partial<PaymentDetails>) =>
     request<{ client_id: number }>('PUT', `/api/clients/${clientId}/payment-details`, data),
+
+  // Payment methods (business-level — attached to contracts)
+  listPaymentMethods: () => request<PaymentMethod[]>('GET', '/api/payment-methods'),
+  addPaymentMethod: (data: PaymentMethodInput) =>
+    request<{ id: number; label: string }>('POST', '/api/payment-methods', data),
+  updatePaymentMethod: (id: number, data: PaymentMethodInput) =>
+    request<{ id: number }>('PUT', `/api/payment-methods/${id}`, data),
+  deletePaymentMethod: (id: number) =>
+    request<{
+      deleted: number
+      label: string
+      detached_contracts: number
+      detached_invoices: number
+    }>('DELETE', `/api/payment-methods/${id}`),
 
   // Contracts
   listContracts: (params?: { client_id?: number; status?: string }) => {
@@ -107,6 +123,21 @@ export const api = {
   },
   addContract: (data: Partial<Contract>) =>
     request<{ id: number }>('POST', '/api/contracts', data),
+  editContract: (
+    id: number,
+    data: {
+      name?: string
+      hourly_rate?: number
+      currency?: string
+      contract_type?: string
+      end_date?: string
+      status?: string
+      payment_terms?: string
+      payment_method_id?: number | null
+      clear_payment_method?: boolean
+      notes?: string
+    },
+  ) => request<{ id: number }>('PUT', `/api/contracts/${id}`, data),
 
   // Time entries
   searchTimeEntries: (params?: {
