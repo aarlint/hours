@@ -17,21 +17,25 @@ type Client struct {
 }
 
 type Contract struct {
-	ID              int        `json:"id"`
-	ClientID        int        `json:"client_id"`
-	ContractNumber  string     `json:"contract_number"`
-	Name            string     `json:"name"`
-	HourlyRate      float64    `json:"hourly_rate"`
-	Currency        string     `json:"currency"`
-	ContractType    string     `json:"contract_type"`
-	StartDate       time.Time  `json:"start_date"`
-	EndDate         *time.Time `json:"end_date,omitempty"`
-	Status          string     `json:"status"`
-	PaymentTerms    string     `json:"payment_terms,omitempty"`
-	PaymentMethodID *int       `json:"payment_method_id,omitempty"`
-	Notes           string     `json:"notes,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
+	ID               int        `json:"id"`
+	ClientID         int        `json:"client_id"`
+	ContractNumber   string     `json:"contract_number"`
+	Name             string     `json:"name"`
+	HourlyRate       float64    `json:"hourly_rate"`
+	Currency         string     `json:"currency"`
+	ContractType     string     `json:"contract_type"`
+	StartDate        time.Time  `json:"start_date"`
+	EndDate          *time.Time `json:"end_date,omitempty"`
+	Status           string     `json:"status"`
+	PaymentTerms     string     `json:"payment_terms,omitempty"`
+	PaymentMethodID  *int       `json:"payment_method_id,omitempty"`
+	Notes            string     `json:"notes,omitempty"`
+	BillingCycleDay  *int       `json:"billing_cycle_day,omitempty"`
+	BillingCycleType string     `json:"billing_cycle_type"`
+	NextBillingDate  *time.Time `json:"next_billing_date,omitempty"`
+	AutoBillEnabled  bool       `json:"auto_bill_enabled"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
 
 	Client *Client `json:"client,omitempty"`
 }
@@ -101,6 +105,7 @@ type Invoice struct {
 
 	Client      *Client     `json:"client,omitempty"`
 	TimeEntries []TimeEntry `json:"time_entries,omitempty"`
+	Expenses    []Expense   `json:"expenses,omitempty"`
 	Contracts   []Contract  `json:"contracts,omitempty"`
 }
 
@@ -116,24 +121,38 @@ type QuoteLineItem struct {
 }
 
 type Quote struct {
-	ID                  int        `json:"id"`
-	ClientID            int        `json:"client_id"`
-	QuoteNumber         string     `json:"quote_number"`
-	Title               string     `json:"title"`
-	IssueDate           time.Time  `json:"issue_date"`
-	ValidUntil          time.Time  `json:"valid_until"`
-	Subtotal            float64    `json:"subtotal"`
-	TotalAmount         float64    `json:"total_amount"`
-	Currency            string     `json:"currency"`
-	Status              string     `json:"status"`
-	Notes               string     `json:"notes,omitempty"`
-	PDFPath             string     `json:"pdf_path,omitempty"`
-	ConvertedContractID *int       `json:"converted_contract_id,omitempty"`
-	CreatedAt           time.Time  `json:"created_at"`
-	UpdatedAt           time.Time  `json:"updated_at"`
+	ID                  int       `json:"id"`
+	ClientID            int       `json:"client_id"`
+	QuoteNumber         string    `json:"quote_number"`
+	Title               string    `json:"title"`
+	IssueDate           time.Time `json:"issue_date"`
+	ValidUntil          time.Time `json:"valid_until"`
+	Subtotal            float64   `json:"subtotal"`
+	TotalAmount         float64   `json:"total_amount"`
+	Currency            string    `json:"currency"`
+	Status              string    `json:"status"`
+	Notes               string    `json:"notes,omitempty"`
+	PDFPath             string    `json:"pdf_path,omitempty"`
+	ConvertedContractID *int      `json:"converted_contract_id,omitempty"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 
 	Client    *Client         `json:"client,omitempty"`
 	LineItems []QuoteLineItem `json:"line_items,omitempty"`
+}
+
+type Expense struct {
+	ID          string    `json:"id"`
+	ClientID    int       `json:"client_id"`
+	ContractID  *int      `json:"contract_id,omitempty"`
+	Date        time.Time `json:"date"`
+	Description string    `json:"description"`
+	Amount      float64   `json:"amount"`
+	Currency    string    `json:"currency"`
+	Category    string    `json:"category,omitempty"`
+	ReceiptPath string    `json:"receipt_path,omitempty"`
+	InvoiceID   *int      `json:"invoice_id,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type BusinessInfo struct {
