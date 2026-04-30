@@ -141,6 +141,23 @@ func createTables(db *sql.DB) error {
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
+	CREATE TABLE IF NOT EXISTS expenses (
+		id TEXT PRIMARY KEY,
+		client_id INTEGER NOT NULL,
+		contract_id INTEGER,
+		date DATE NOT NULL,
+		description TEXT NOT NULL,
+		amount REAL NOT NULL,
+		currency TEXT DEFAULT 'USD',
+		category TEXT,
+		receipt_path TEXT,
+		invoice_id INTEGER,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE,
+		FOREIGN KEY (contract_id) REFERENCES contracts(id),
+		FOREIGN KEY (invoice_id) REFERENCES invoices(id)
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_time_entries_date ON time_entries(date);
 	CREATE INDEX IF NOT EXISTS idx_time_entries_client ON time_entries(client_id);
 	CREATE INDEX IF NOT EXISTS idx_invoices_client ON invoices(client_id);
@@ -148,6 +165,9 @@ func createTables(db *sql.DB) error {
 	CREATE INDEX IF NOT EXISTS idx_contracts_client ON contracts(client_id);
 	CREATE INDEX IF NOT EXISTS idx_contracts_status ON contracts(status);
 	CREATE INDEX IF NOT EXISTS idx_contracts_dates ON contracts(start_date, end_date);
+	CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
+	CREATE INDEX IF NOT EXISTS idx_expenses_client ON expenses(client_id);
+	CREATE INDEX IF NOT EXISTS idx_expenses_invoice ON expenses(invoice_id);
 	`
 
 	if _, err := db.Exec(schema); err != nil {
@@ -217,6 +237,12 @@ func runMigrations(db *sql.DB) error {
 			name: "remove_rate_constraints_from_clients",
 			apply: func(db *sql.DB) error {
 				return removeRateConstraintsFromClients(db)
+			},
+		},
+		{
+			name: "add_billing_cycles_to_contracts",
+			apply: func(db *sql.DB) error {
+				return addBillingCyclesToContracts(db)
 			},
 		},
 	}
@@ -420,5 +446,47 @@ func removeRateConstraintsFromClients(db *sql.DB) error {
 	}
 
 	fmt.Println("Successfully removed rate constraints from clients table")
+	return nil
+}
+
+func addBillingCyclesToContracts(db *sql.DB) error {
+	fmt.Println("Adding billing cycle support to contracts table...")
+
+	// Add billing cycle columns
+	if err := addColumnIfNotExists(db, "contracts", "billing_cycle_day", "INTEGER"); err != nil {
+		return fmt.Errorf("failed to add billing_cycle_day column: %w", err)
+	}
+
+	if err := addColumnIfNotExists(db, "contracts", "billing_cycle_type", "TEXT DEFAULT 'monthly'"); err != nil {
+		return fmt.Errorf("failed to add billing_cycle_type column: %w", err)
+	}
+
+	if err := addColumnIfNotExists(db, "contracts", "next_billing_date", "DATE"); err != nil {
+		return fmt.Errorf("failed to add next_billing_date column: %w", err)
+	}
+
+	if err := addColumnIfNotExists(db, "contracts", "auto_bill_enabled", "BOOLEAN DEFAULT FALSE"); err != nil {
+		return fmt.Errorf("failed to add auto_bill_enabled column: %w", err)
+	}
+
+	// Set default billing cycle type for existing contracts
+	_, err := db.Exec(`
+		UPDATE contracts
+		SET billing_cycle_type = 'monthly'
+		WHERE billing_cycle_type IS NULL OR billing_cycle_type = ''
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to set default billing cycle type: %w", err)
+	}
+
+	// Add index for billing date queries
+	_, err = db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_contracts_billing_date ON contracts(next_billing_date, status)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create billing date index: %w", err)
+	}
+
+	fmt.Println("Successfully added billing cycle support to contracts")
 	return nil
 }
