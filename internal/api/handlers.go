@@ -1083,6 +1083,146 @@ func (h *handlers) getInvoiceDetails(w http.ResponseWriter, r *http.Request) (in
 	return invoiceDetailsResponse{Invoice: inv, TimeEntries: entries, TotalHours: total}, nil
 }
 
+// invoicePreviewResponse is the render-ready payload for the HTML preview.
+// Everything the UI needs to draw the invoice without extra round-trips.
+type invoicePreviewResponse struct {
+	Invoice     invoiceDTO            `json:"invoice"`
+	Client      models.Client         `json:"client"`
+	Contracts   []models.Contract     `json:"contracts"`
+	TimeEntries []timeEntryDTO        `json:"time_entries"`
+	TotalHours  float64               `json:"total_hours"`
+	Payment     models.PaymentDetails `json:"payment"`
+	Recipients  []models.Recipient    `json:"recipients"`
+	Business    models.BusinessInfo   `json:"business"`
+}
+
+func (h *handlers) getInvoicePreview(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	number := r.PathValue("number")
+
+	var inv invoiceDTO
+	err := h.db.QueryRow(`
+		SELECT i.id, i.invoice_number, i.client_id, c.name, i.issue_date, i.due_date,
+		       i.total_amount, i.status, COALESCE(i.pdf_path,''), i.created_at
+		FROM invoices i
+		JOIN clients c ON i.client_id = c.id
+		WHERE i.invoice_number = ?
+	`, number).Scan(&inv.ID, &inv.InvoiceNumber, &inv.ClientID, &inv.ClientName,
+		&inv.IssueDate, &inv.DueDate, &inv.TotalAmount, &inv.Status, &inv.PDFPath, &inv.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, newAPIError(http.StatusNotFound, "invoice not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var client models.Client
+	if err := h.db.QueryRow(`
+		SELECT id, name, COALESCE(address,''), COALESCE(city,''), COALESCE(state,''),
+		       COALESCE(zip_code,''), COALESCE(country,'')
+		FROM clients WHERE id = ?
+	`, inv.ClientID).Scan(&client.ID, &client.Name, &client.Address, &client.City,
+		&client.State, &client.ZipCode, &client.Country); err != nil {
+		return nil, err
+	}
+
+	entries, err := h.queryTimeEntries(`
+		SELECT te.id, te.contract_id, te.date, te.hours, te.description, te.invoice_id, te.created_at,
+		       cl.id, cl.name, ct.contract_number, ct.name, ct.hourly_rate, ct.currency, i.invoice_number
+		FROM time_entries te
+		JOIN contracts ct ON te.contract_id = ct.id
+		JOIN clients cl ON ct.client_id = cl.id
+		LEFT JOIN invoices i ON te.invoice_id = i.id
+		WHERE te.invoice_id = ?
+		ORDER BY te.date
+	`, inv.ID)
+	if err != nil {
+		return nil, err
+	}
+	totalHours := 0.0
+	for _, e := range entries {
+		totalHours += e.Hours
+	}
+
+	// Contracts referenced by the entries (deduplicated, in first-seen order).
+	seen := map[int]bool{}
+	var contracts []models.Contract
+	contractRows, _ := h.db.Query(`
+		SELECT id, client_id, contract_number, name, hourly_rate, currency,
+		       contract_type, start_date, end_date, status, COALESCE(payment_terms,''),
+		       COALESCE(notes,''), created_at, updated_at
+		FROM contracts WHERE client_id = ?
+	`, inv.ClientID)
+	contractByID := map[int]models.Contract{}
+	if contractRows != nil {
+		for contractRows.Next() {
+			var c models.Contract
+			var endDate sql.NullTime
+			if err := contractRows.Scan(&c.ID, &c.ClientID, &c.ContractNumber, &c.Name,
+				&c.HourlyRate, &c.Currency, &c.ContractType, &c.StartDate, &endDate,
+				&c.Status, &c.PaymentTerms, &c.Notes, &c.CreatedAt, &c.UpdatedAt); err != nil {
+				continue
+			}
+			if endDate.Valid {
+				t := endDate.Time
+				c.EndDate = &t
+			}
+			contractByID[c.ID] = c
+		}
+		contractRows.Close()
+	}
+	for _, e := range entries {
+		if seen[e.ContractID] {
+			continue
+		}
+		seen[e.ContractID] = true
+		if c, ok := contractByID[e.ContractID]; ok {
+			contracts = append(contracts, c)
+		}
+	}
+
+	payment := ResolveInvoicePaymentDetails(h.db, int64(inv.ID), inv.ClientID)
+
+	var recipients []models.Recipient
+	recRows, _ := h.db.Query(`
+		SELECT id, client_id, name, email, COALESCE(title,''), COALESCE(phone,''), is_primary, created_at
+		FROM recipients WHERE client_id = ? ORDER BY is_primary DESC
+	`, inv.ClientID)
+	if recRows != nil {
+		for recRows.Next() {
+			var rcp models.Recipient
+			if err := recRows.Scan(&rcp.ID, &rcp.ClientID, &rcp.Name, &rcp.Email,
+				&rcp.Title, &rcp.Phone, &rcp.IsPrimary, &rcp.CreatedAt); err != nil {
+				continue
+			}
+			recipients = append(recipients, rcp)
+		}
+		recRows.Close()
+	}
+
+	var business models.BusinessInfo
+	_ = h.db.QueryRow(`
+		SELECT id, business_name, contact_name, email, COALESCE(phone,''), COALESCE(address,''),
+		       COALESCE(city,''), COALESCE(state,''), COALESCE(zip_code,''), COALESCE(country,''),
+		       COALESCE(tax_id,''), COALESCE(website,''), COALESCE(logo_path,''),
+		       COALESCE(invoice_prefix,'INV'), COALESCE(export_path,''), updated_at
+		FROM business_info WHERE id = 1
+	`).Scan(&business.ID, &business.BusinessName, &business.ContactName, &business.Email,
+		&business.Phone, &business.Address, &business.City, &business.State,
+		&business.ZipCode, &business.Country, &business.TaxID, &business.Website,
+		&business.LogoPath, &business.InvoicePrefix, &business.ExportPath, &business.UpdatedAt)
+
+	return invoicePreviewResponse{
+		Invoice:     inv,
+		Client:      client,
+		Contracts:   contracts,
+		TimeEntries: entries,
+		TotalHours:  totalHours,
+		Payment:     payment,
+		Recipients:  recipients,
+		Business:    business,
+	}, nil
+}
+
 type createInvoiceReq struct {
 	ClientID  int    `json:"client_id"`
 	Period    string `json:"period"`

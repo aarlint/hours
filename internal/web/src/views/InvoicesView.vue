@@ -2,12 +2,13 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 import { api, formatCurrency } from '../api'
-import type { Client, Invoice } from '../types'
+import type { Client, Invoice, InvoicePreview as InvoicePreviewData } from '../types'
 import PageHeader from '../components/PageHeader.vue'
 import Modal from '../components/Modal.vue'
 import LoadingBar from '../components/LoadingBar.vue'
 import EmptyState from '../components/EmptyState.vue'
 import StatusChip from '../components/StatusChip.vue'
+import InvoicePreview from '../components/InvoicePreview.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { isWails, revealInFinder } from '../wailsShim'
 
@@ -27,6 +28,12 @@ const createError = ref<string | null>(null)
 const createResult = ref<{ invoice_number: string; total_amount: number; pdf_path?: string } | null>(null)
 const downloadingNumber = ref<string | null>(null)
 const nativeReveal = isWails()
+
+const previewOpen = ref(false)
+const previewLoading = ref(false)
+const previewError = ref<string | null>(null)
+const previewData = ref<InvoicePreviewData | null>(null)
+const previewNumber = ref<string>('')
 
 const form = reactive({
   client_id: 0,
@@ -109,6 +116,21 @@ async function markStatus(inv: Invoice, status: string) {
       message: e.message,
       tone: 'warning',
     })
+  }
+}
+
+async function openPreview(inv: Invoice) {
+  previewNumber.value = inv.invoice_number
+  previewOpen.value = true
+  previewError.value = null
+  previewData.value = null
+  previewLoading.value = true
+  try {
+    previewData.value = await api.previewInvoice(inv.invoice_number)
+  } catch (e: any) {
+    previewError.value = e.message
+  } finally {
+    previewLoading.value = false
   }
 }
 
@@ -256,6 +278,12 @@ const totalPaid = computed(() =>
           <td class="actions">
             <button
               class="btn btn-ghost btn-sm"
+              @click="openPreview(inv)"
+            >
+              PREVIEW
+            </button>
+            <button
+              class="btn btn-ghost btn-sm"
               :disabled="downloadingNumber === inv.invoice_number"
               @click="downloadInvoice(inv)"
             >
@@ -360,6 +388,22 @@ const totalPaid = computed(() =>
           </button>
         </div>
       </form>
+    </Modal>
+
+    <Modal
+      :open="previewOpen"
+      :title="'PREVIEW · ' + previewNumber"
+      wide
+      @close="previewOpen = false"
+    >
+      <div v-if="previewLoading" class="preview-state">
+        <LoadingBar text="RENDERING INVOICE" />
+      </div>
+      <div v-else-if="previewError" class="preview-state">
+        <div class="mono-label text-accent">[ ERROR ]</div>
+        <p style="margin-top: 8px">{{ previewError }}</p>
+      </div>
+      <InvoicePreview v-else-if="previewData" :data="previewData" />
     </Modal>
   </div>
 </template>
@@ -473,6 +517,11 @@ const totalPaid = computed(() =>
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--ink-3);
+}
+
+.preview-state {
+  padding: var(--space-xl);
+  text-align: center;
 }
 
 @media (max-width: 700px) {

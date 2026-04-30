@@ -4,6 +4,7 @@ import type {
   Contract,
   Invoice,
   InvoiceDetails,
+  InvoicePreview,
   PaymentDetails,
   PaymentMethod,
   PaymentMethodInput,
@@ -195,6 +196,8 @@ export const api = {
   },
   getInvoice: (number: string) =>
     request<InvoiceDetails>('GET', `/api/invoices/${encodeURIComponent(number)}`),
+  previewInvoice: (number: string) =>
+    request<InvoicePreview>('GET', `/api/invoices/${encodeURIComponent(number)}/preview`),
   createInvoice: (data: {
     client_id: number
     period?: string

@@ -114,6 +114,17 @@ export interface InvoiceDetails {
   total_hours: number
 }
 
+export interface InvoicePreview {
+  invoice: Invoice
+  client: Client
+  contracts: Contract[]
+  time_entries: TimeEntry[]
+  total_hours: number
+  payment: PaymentDetails
+  recipients: Recipient[]
+  business: BusinessInfo
+}
+
 export interface QuoteLineItem {
   id: number
   quote_id: number

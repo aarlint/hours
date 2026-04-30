@@ -96,6 +96,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/invoices", jsonHandler(h.listInvoices))
 	s.mux.HandleFunc("POST /api/invoices", jsonHandler(h.createInvoice))
 	s.mux.HandleFunc("GET /api/invoices/{number}", jsonHandler(h.getInvoiceDetails))
+	s.mux.HandleFunc("GET /api/invoices/{number}/preview", jsonHandler(h.getInvoicePreview))
 	s.mux.HandleFunc("PATCH /api/invoices/{number}", jsonHandler(h.updateInvoiceStatus))
 	s.mux.HandleFunc("DELETE /api/invoices/{number}", jsonHandler(h.deleteInvoice))
 	s.mux.HandleFunc("POST /api/invoices/{number}/download", jsonHandler(h.downloadInvoice))

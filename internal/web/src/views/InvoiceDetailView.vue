@@ -2,11 +2,13 @@
 import { computed, onMounted, ref } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { api, formatCurrency, formatHours } from '../api'
-import type { InvoiceDetails } from '../types'
+import type { InvoiceDetails, InvoicePreview as InvoicePreviewData } from '../types'
 import PageHeader from '../components/PageHeader.vue'
 import LoadingBar from '../components/LoadingBar.vue'
 import StatusChip from '../components/StatusChip.vue'
 import EmptyState from '../components/EmptyState.vue'
+import Modal from '../components/Modal.vue'
+import InvoicePreview from '../components/InvoicePreview.vue'
 import { isWails, revealInFinder } from '../wailsShim'
 
 const route = useRoute()
@@ -19,6 +21,11 @@ const data = ref<InvoiceDetails | null>(null)
 const statusMsg = ref<string>('')
 const downloading = ref(false)
 const nativeReveal = isWails()
+
+const previewOpen = ref(false)
+const previewLoading = ref(false)
+const previewData = ref<InvoicePreviewData | null>(null)
+const previewError = ref<string | null>(null)
 
 async function load() {
   loading.value = true
@@ -45,6 +52,23 @@ async function downloadPdf() {
     statusMsg.value = 'ERROR: ' + e.message
   } finally {
     downloading.value = false
+  }
+}
+
+async function openPreview() {
+  if (!data.value) return
+  previewOpen.value = true
+  previewError.value = null
+  if (previewData.value && previewData.value.invoice.invoice_number === data.value.invoice.invoice_number) {
+    return
+  }
+  previewLoading.value = true
+  try {
+    previewData.value = await api.previewInvoice(data.value.invoice.invoice_number)
+  } catch (e: any) {
+    previewError.value = e.message
+  } finally {
+    previewLoading.value = false
   }
 }
 
@@ -96,6 +120,12 @@ const daysUntilDue = computed(() => {
         <span v-if="statusMsg" class="mono-label" :class="statusMsg.startsWith('ERROR') ? 'text-accent' : 'text-success'">
           [ {{ statusMsg }} ]
         </span>
+        <button
+          class="btn btn-secondary"
+          @click="openPreview"
+        >
+          PREVIEW
+        </button>
         <button
           class="btn btn-secondary"
           :disabled="downloading"
@@ -215,6 +245,22 @@ const daysUntilDue = computed(() => {
       </table>
     </section>
   </div>
+
+  <Modal
+    :open="previewOpen"
+    :title="data ? 'PREVIEW · ' + data.invoice.invoice_number : 'PREVIEW'"
+    wide
+    @close="previewOpen = false"
+  >
+    <div v-if="previewLoading" class="preview-state">
+      <LoadingBar text="RENDERING INVOICE" />
+    </div>
+    <div v-else-if="previewError" class="preview-state">
+      <div class="mono-label text-accent">[ ERROR ]</div>
+      <p style="margin-top: 8px">{{ previewError }}</p>
+    </div>
+    <InvoicePreview v-else-if="previewData" :data="previewData" />
+  </Modal>
 </template>
 
 <style scoped>
@@ -275,6 +321,11 @@ const daysUntilDue = computed(() => {
 tfoot td {
   padding-top: var(--space-md);
   border-top: 1px solid var(--border);
+}
+
+.preview-state {
+  padding: var(--space-xl);
+  text-align: center;
 }
 
 @media (max-width: 900px) {
