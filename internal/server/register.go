@@ -9,6 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/austin/hours-mcp/internal/api"
+	"github.com/austin/hours-mcp/internal/backup"
+	"github.com/austin/hours-mcp/internal/billing"
 	"github.com/austin/hours-mcp/internal/models"
 	"github.com/austin/hours-mcp/internal/pdf"
 	"github.com/austin/hours-mcp/internal/timeparse"
@@ -186,16 +189,19 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 
 	// Add Contract tool
 	type addContractArgs struct {
-		ClientName     string  `json:"client_name" jsonschema:"Client name"`
-		ContractNumber string  `json:"contract_number" jsonschema:"Contract number (unique identifier)"`
-		Name           string  `json:"name" jsonschema:"Contract name/description"`
-		HourlyRate     float64 `json:"hourly_rate" jsonschema:"Hourly rate for this contract"`
-		Currency       string  `json:"currency,omitempty" jsonschema:"Currency code (e.g. USD, EUR)"`
-		ContractType   string  `json:"contract_type,omitempty" jsonschema:"Contract type (hourly, fixed, retainer)"`
-		StartDate      string  `json:"start_date" jsonschema:"Contract start date (YYYY-MM-DD)"`
-		EndDate        string  `json:"end_date,omitempty" jsonschema:"Contract end date (YYYY-MM-DD, optional)"`
-		PaymentTerms   string  `json:"payment_terms,omitempty" jsonschema:"Payment terms (e.g. 'Net 30')"`
-		Notes          string  `json:"notes,omitempty" jsonschema:"Additional notes"`
+		ClientName       string `json:"client_name" jsonschema:"Client name"`
+		ContractNumber   string `json:"contract_number" jsonschema:"Contract number (unique identifier)"`
+		Name             string `json:"name" jsonschema:"Contract name/description"`
+		HourlyRate       float64 `json:"hourly_rate" jsonschema:"Hourly rate for this contract"`
+		Currency         string `json:"currency,omitempty" jsonschema:"Currency code (e.g. USD, EUR)"`
+		ContractType     string `json:"contract_type,omitempty" jsonschema:"Contract type (hourly, fixed, retainer)"`
+		StartDate        string `json:"start_date" jsonschema:"Contract start date (YYYY-MM-DD)"`
+		EndDate          string `json:"end_date,omitempty" jsonschema:"Contract end date (YYYY-MM-DD, optional)"`
+		PaymentTerms     string `json:"payment_terms,omitempty" jsonschema:"Payment terms (e.g. 'Net 30')"`
+		Notes            string `json:"notes,omitempty" jsonschema:"Additional notes"`
+		BillingCycleDay  *int   `json:"billing_cycle_day,omitempty" jsonschema:"Day of month for billing cycle (1-31)"`
+		BillingCycleType string `json:"billing_cycle_type,omitempty" jsonschema:"Billing cycle type (monthly, weekly, quarterly, annually)"`
+		AutoBillEnabled  bool   `json:"auto_bill_enabled,omitempty" jsonschema:"Enable automatic billing for this contract"`
 	}
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -214,6 +220,19 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 		}
 		if args.ContractType == "" {
 			args.ContractType = "hourly"
+		}
+		if args.BillingCycleType == "" && args.BillingCycleDay != nil {
+			args.BillingCycleType = "monthly"
+		}
+
+		// Validate billing cycle parameters
+		if args.BillingCycleDay != nil {
+			if *args.BillingCycleDay < 1 || *args.BillingCycleDay > 31 {
+				return nil, nil, fmt.Errorf("billing cycle day must be between 1 and 31")
+			}
+		}
+		if args.BillingCycleType != "" && !billing.IsValidCycleType(args.BillingCycleType) {
+			return nil, nil, fmt.Errorf("invalid billing cycle type: %s. Valid types: %v", args.BillingCycleType, billing.ValidCycleTypes())
 		}
 
 		// Parse dates
@@ -234,8 +253,8 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 		// Insert contract
 		var contractID int64
 		err = db.QueryRow(`
-			INSERT INTO contracts (client_id, contract_number, name, hourly_rate, currency, contract_type, start_date, end_date, payment_terms, notes)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO contracts (client_id, contract_number, name, hourly_rate, currency, contract_type, start_date, end_date, payment_terms, notes, billing_cycle_day, billing_cycle_type, auto_bill_enabled)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			RETURNING id
 		`, clientID, args.ContractNumber, args.Name, args.HourlyRate, args.Currency, args.ContractType, startDate.Format("2006-01-02"),
 			func() interface{} {
@@ -243,17 +262,59 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 					return endDate.Format("2006-01-02")
 				}
 				return nil
-			}(), args.PaymentTerms, args.Notes).Scan(&contractID)
+			}(), args.PaymentTerms, args.Notes, args.BillingCycleDay, args.BillingCycleType, args.AutoBillEnabled).Scan(&contractID)
 
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to add contract: %w", err)
 		}
 
+		// Calculate and set next billing date if billing cycle is configured
+		message := fmt.Sprintf("Successfully added contract %s for %s (ID: %d)", args.ContractNumber, args.ClientName, contractID)
+		if args.BillingCycleDay != nil {
+			contract := models.Contract{
+				ID:               int(contractID),
+				ClientID:         clientID,
+				ContractNumber:   args.ContractNumber,
+				Name:             args.Name,
+				HourlyRate:       args.HourlyRate,
+				Currency:         args.Currency,
+				ContractType:     args.ContractType,
+				StartDate:        startDate,
+				EndDate:          endDate,
+				PaymentTerms:     args.PaymentTerms,
+				Notes:            args.Notes,
+				BillingCycleDay:  args.BillingCycleDay,
+				BillingCycleType: args.BillingCycleType,
+				AutoBillEnabled:  args.AutoBillEnabled,
+			}
+
+			nextBilling, err := billing.CalculateNextBillingDate(contract)
+			if err == nil && nextBilling != nil {
+				_, err = db.Exec(`
+					UPDATE contracts SET next_billing_date = ? WHERE id = ?
+				`, nextBilling.Format("2006-01-02"), contractID)
+				if err == nil {
+					message += fmt.Sprintf("\nBilling cycle: %s on day %d", args.BillingCycleType, *args.BillingCycleDay)
+					if args.AutoBillEnabled {
+						message += " (auto-billing enabled)"
+					}
+					message += fmt.Sprintf("\nNext billing date: %s", nextBilling.Format("2006-01-02"))
+				}
+			}
+		}
+
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
-				&mcp.TextContent{Text: fmt.Sprintf("Successfully added contract %s for %s (ID: %d)", args.ContractNumber, args.ClientName, contractID)},
+				&mcp.TextContent{Text: message},
 			},
-		}, nil, nil
+		}, map[string]interface{}{
+			"contract_id":       contractID,
+			"contract_number":   args.ContractNumber,
+			"client_name":       args.ClientName,
+			"billing_cycle_day": args.BillingCycleDay,
+			"billing_cycle_type": args.BillingCycleType,
+			"auto_bill_enabled": args.AutoBillEnabled,
+		}, nil
 	})
 
 	// List Contracts tool
@@ -736,14 +797,9 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 			return nil, nil, fmt.Errorf("failed to check business info: %w", err)
 		}
 
-		// Validate payment details exist for client
-		var paymentBankName string
-		err = db.QueryRow("SELECT bank_name FROM payment_details WHERE client_id = ?", clientID).Scan(&paymentBankName)
-		if err == sql.ErrNoRows {
-			return nil, nil, fmt.Errorf("payment details not configured for client '%s'. Please use 'set_payment_details' to configure payment information before creating invoices", args.ClientName)
-		} else if err != nil {
-			return nil, nil, fmt.Errorf("failed to check payment details: %w", err)
-		}
+		// Payment info is now optional — snapshotted from the contract
+		// below, with a legacy per-client fallback. The PDF layer handles
+		// the empty case gracefully.
 
 		startDate, endDate, err := timeparse.ParsePeriod(args.Period)
 		if err != nil {
@@ -786,8 +842,39 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 			totalAmount += e.Hours * hourlyRate
 		}
 
-		if len(entries) == 0 {
-			return nil, nil, fmt.Errorf("no unbilled hours found for %s in %s", args.ClientName, args.Period)
+		expenseRows, err := db.Query(`
+			SELECT id, client_id, contract_id, date, description, amount, currency, category, receipt_path
+			FROM expenses
+			WHERE client_id = ? AND date >= ? AND date <= ? AND invoice_id IS NULL
+			ORDER BY date
+		`, clientID, startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to get expenses: %w", err)
+		}
+		defer expenseRows.Close()
+
+		var expenses []models.Expense
+		var totalExpenses float64
+		for expenseRows.Next() {
+			var e models.Expense
+			var category, receiptPath sql.NullString
+			if err := expenseRows.Scan(&e.ID, &e.ClientID, &e.ContractID, &e.Date, &e.Description,
+				&e.Amount, &e.Currency, &category, &receiptPath); err != nil {
+				return nil, nil, fmt.Errorf("failed to scan expense: %w", err)
+			}
+			if category.Valid {
+				e.Category = category.String
+			}
+			if receiptPath.Valid {
+				e.ReceiptPath = receiptPath.String
+			}
+			expenses = append(expenses, e)
+			totalExpenses += e.Amount
+		}
+		totalAmount += totalExpenses
+
+		if len(entries) == 0 && len(expenses) == 0 {
+			return nil, nil, fmt.Errorf("no unbilled hours or expenses found for %s in %s", args.ClientName, args.Period)
 		}
 		invoiceNumber := fmt.Sprintf("INV-%s-%s", time.Now().Format("200601"), uuid.New().String()[:8])
 		issueDate := time.Now()
@@ -799,10 +886,19 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 		}
 		defer tx.Rollback()
 
+		// Snapshot the client's contract payment method onto this invoice.
+		var paymentMethodID sql.NullInt64
+		_ = db.QueryRow(`
+			SELECT payment_method_id FROM contracts
+			WHERE client_id = ? AND payment_method_id IS NOT NULL
+			ORDER BY (status = 'active') DESC, id
+			LIMIT 1
+		`, clientID).Scan(&paymentMethodID)
+
 		result, err := tx.Exec(`
-			INSERT INTO invoices (client_id, invoice_number, issue_date, due_date, total_amount, status)
-			VALUES (?, ?, ?, ?, ?, 'pending')
-		`, clientID, invoiceNumber, issueDate.Format("2006-01-02"), dueDate.Format("2006-01-02"), totalAmount)
+			INSERT INTO invoices (client_id, invoice_number, issue_date, due_date, total_amount, status, payment_method_id)
+			VALUES (?, ?, ?, ?, ?, 'pending', ?)
+		`, clientID, invoiceNumber, issueDate.Format("2006-01-02"), dueDate.Format("2006-01-02"), totalAmount, paymentMethodID)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to create invoice: %w", err)
 		}
@@ -819,15 +915,10 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 			Status:        "pending",
 			Client:        &client,
 			TimeEntries:   entries,
+			Expenses:      expenses,
 		}
 
-		var paymentDetails models.PaymentDetails
-		db.QueryRow(`
-			SELECT bank_name, account_number, routing_number, swift_code, payment_terms, notes
-			FROM payment_details WHERE client_id = ?
-		`, clientID).Scan(&paymentDetails.BankName, &paymentDetails.AccountNumber,
-			&paymentDetails.RoutingNumber, &paymentDetails.SwiftCode,
-			&paymentDetails.PaymentTerms, &paymentDetails.Notes)
+		paymentDetails := api.ResolveInvoicePaymentDetails(db, invoiceID, clientID)
 
 		var recipients []models.Recipient
 		recipientRows, err := db.Query(`
@@ -864,6 +955,14 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 			}
 		}
 
+		// Link expenses to the invoice
+		for _, ex := range expenses {
+			_, err = tx.Exec(`UPDATE expenses SET invoice_id = ? WHERE id = ?`, invoiceID, ex.ID)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to link expense to invoice: %w", err)
+			}
+		}
+
 		// Update invoice entries with contract info for PDF generation
 		for i := range entries {
 			var contract models.Contract
@@ -894,14 +993,16 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 		return &mcp.CallToolResult{
 				Content: []mcp.Content{
 					&mcp.TextContent{
-						Text: fmt.Sprintf("Invoice %s created successfully\nTotal: $%.2f (%.2f hours)\nPDF saved to: %s",
-							invoiceNumber, totalAmount, totalHours, pdfPath),
+						Text: fmt.Sprintf("Invoice %s created successfully\nTotal: $%.2f (%.2f hours, $%.2f expenses)\nPDF saved to: %s",
+							invoiceNumber, totalAmount, totalHours, totalExpenses, pdfPath),
 					},
 				},
 			}, map[string]interface{}{
 				"invoice_number": invoiceNumber,
 				"total_amount":   totalAmount,
 				"total_hours":    totalHours,
+				"total_expenses": totalExpenses,
+				"expense_count":  len(expenses),
 				"pdf_path":       pdfPath,
 			}, nil
 	})
@@ -1595,9 +1696,30 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 			for rows.Next() {
 				var e models.TimeEntry
 				if err := rows.Scan(&e.ID, &e.Date, &e.Hours, &e.Description); err == nil {
-					// Note: ContractRef field no longer exists in TimeEntry model
 					entries = append(entries, e)
 					totalHours += e.Hours
+				}
+			}
+		}
+
+		expenseRows, err := db.Query(`
+			SELECT id, client_id, contract_id, date, description, amount, currency,
+			       COALESCE(category, ''), COALESCE(receipt_path, '')
+			FROM expenses
+			WHERE invoice_id = ?
+			ORDER BY date
+		`, invoice.ID)
+
+		var expenses []models.Expense
+		var totalExpenses float64
+		if err == nil {
+			defer expenseRows.Close()
+			for expenseRows.Next() {
+				var e models.Expense
+				if err := expenseRows.Scan(&e.ID, &e.ClientID, &e.ContractID, &e.Date, &e.Description,
+					&e.Amount, &e.Currency, &e.Category, &e.ReceiptPath); err == nil {
+					expenses = append(expenses, e)
+					totalExpenses += e.Amount
 				}
 			}
 		}
@@ -1609,6 +1731,7 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 		text += fmt.Sprintf("Status: %s\n", invoice.Status)
 		text += fmt.Sprintf("Total Amount: $%.2f\n", invoice.TotalAmount)
 		text += fmt.Sprintf("Total Hours: %.2f\n", totalHours)
+		text += fmt.Sprintf("Total Expenses: $%.2f\n", totalExpenses)
 		if invoice.PDFPath != "" {
 			text += fmt.Sprintf("PDF Path: %s\n", invoice.PDFPath)
 		}
@@ -1617,16 +1740,27 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 			text += fmt.Sprintf("- ID %s: %s - %.2f hours (%s)\n",
 				e.ID, e.Date.Format("2006-01-02"), e.Hours, e.Description)
 		}
+		text += fmt.Sprintf("\nExpenses (%d):\n", len(expenses))
+		for _, e := range expenses {
+			cat := ""
+			if e.Category != "" {
+				cat = fmt.Sprintf(" [%s]", e.Category)
+			}
+			text += fmt.Sprintf("- ID %s: %s -%s %s %.2f (%s)\n",
+				e.ID[:8], e.Date.Format("2006-01-02"), cat, e.Currency, e.Amount, e.Description)
+		}
 
 		return &mcp.CallToolResult{
 				Content: []mcp.Content{
 					&mcp.TextContent{Text: text},
 				},
 			}, map[string]interface{}{
-				"invoice":      invoice,
-				"client_name":  clientName,
-				"time_entries": entries,
-				"total_hours":  totalHours,
+				"invoice":        invoice,
+				"client_name":    clientName,
+				"time_entries":   entries,
+				"expenses":       expenses,
+				"total_hours":    totalHours,
+				"total_expenses": totalExpenses,
 			}, nil
 	})
 
@@ -1903,6 +2037,718 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 				"count":        len(invoices),
 			}, nil
 	})
+
+	// Database Backup tool
+	type createBackupArgs struct {
+		BackupPath string `json:"backup_path" jsonschema:"Path to save the backup file"`
+		Validate   bool   `json:"validate,omitempty" jsonschema:"Validate backup after creation (default: true)"`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "create_database_backup",
+		Description: "Create a backup of the database",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args createBackupArgs) (*mcp.CallToolResult, any, error) {
+		backupService := backup.New(db)
+
+		// Auto-generate filename if only directory is provided
+		if strings.HasSuffix(args.BackupPath, "/") || isDirectory(args.BackupPath) {
+			autoBackupPath, err := backupService.CreateAutoBackup(args.BackupPath)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to create backup: %w", err)
+			}
+
+			if args.Validate {
+				if err := backupService.ValidateBackup(autoBackupPath); err != nil {
+					return &mcp.CallToolResult{
+						Content: []mcp.Content{
+							&mcp.TextContent{
+								Text: fmt.Sprintf("Backup created but validation failed: %s\nPath: %s", err.Error(), autoBackupPath),
+							},
+						},
+					}, map[string]interface{}{
+						"backup_path": autoBackupPath,
+						"validated":   false,
+						"error":       err.Error(),
+					}, nil
+				}
+			}
+
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{
+						Text: fmt.Sprintf("Database backup created successfully: %s", autoBackupPath),
+					},
+				},
+			}, map[string]interface{}{
+				"backup_path": autoBackupPath,
+				"validated":   args.Validate,
+			}, nil
+		}
+
+		// Manual backup path
+		if err := backupService.Backup(args.BackupPath); err != nil {
+			return nil, nil, fmt.Errorf("failed to create backup: %w", err)
+		}
+
+		validated := false
+		validationError := ""
+		if args.Validate {
+			if err := backupService.ValidateBackup(args.BackupPath); err != nil {
+				validationError = err.Error()
+			} else {
+				validated = true
+			}
+		}
+
+		message := fmt.Sprintf("Database backup created successfully: %s", args.BackupPath)
+		if args.Validate {
+			if validated {
+				message += "\nBackup validation: PASSED"
+			} else {
+				message += fmt.Sprintf("\nBackup validation: FAILED - %s", validationError)
+			}
+		}
+
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: message},
+			},
+		}, map[string]interface{}{
+			"backup_path":      args.BackupPath,
+			"validated":        validated,
+			"validation_error": validationError,
+		}, nil
+	})
+
+	// Database Restore tool
+	type restoreBackupArgs struct {
+		BackupPath       string `json:"backup_path" jsonschema:"Path to the backup file to restore from"`
+		SkipValidation   bool   `json:"skip_validation,omitempty" jsonschema:"Skip backup validation before restore"`
+		ConfirmRestore   bool   `json:"confirm_restore" jsonschema:"Confirm that you want to replace the current database"`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "restore_database_backup",
+		Description: "Restore the database from a backup file (WARNING: This will replace your current database)",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args restoreBackupArgs) (*mcp.CallToolResult, any, error) {
+		if !args.ConfirmRestore {
+			return nil, nil, fmt.Errorf("restore cancelled - you must set confirm_restore to true to proceed")
+		}
+
+		backupService := backup.New(db)
+
+		// Validate backup before restoring unless explicitly skipped
+		if !args.SkipValidation {
+			if err := backupService.ValidateBackup(args.BackupPath); err != nil {
+				return nil, nil, fmt.Errorf("backup validation failed: %w", err)
+			}
+		}
+
+		if err := backupService.Restore(args.BackupPath); err != nil {
+			return nil, nil, fmt.Errorf("failed to restore backup: %w", err)
+		}
+
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{
+					Text: fmt.Sprintf("Database restored successfully from: %s\nApplication restart may be required for changes to take effect.", args.BackupPath),
+				},
+			},
+		}, map[string]interface{}{
+			"backup_path": args.BackupPath,
+			"restored":    true,
+		}, nil
+	})
+
+	// List Backups tool
+	type listBackupsArgs struct {
+		BackupDirectory string `json:"backup_directory,omitempty" jsonschema:"Directory to search for backup files (optional)"`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "list_database_backups",
+		Description: "List available database backup files",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args listBackupsArgs) (*mcp.CallToolResult, any, error) {
+		backupDir := args.BackupDirectory
+		if backupDir == "" {
+			// Default to user's home directory + /hours-backups
+			homeDir, err := os.UserHomeDir()
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get home directory: %w", err)
+			}
+			backupDir = filepath.Join(homeDir, "hours-backups")
+		}
+
+		backupService := backup.New(db)
+		backups, err := backupService.ListBackups(backupDir)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to list backups: %w", err)
+		}
+
+		if len(backups) == 0 {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{
+						Text: fmt.Sprintf("No backup files found in: %s", backupDir),
+					},
+				},
+			}, map[string]interface{}{
+				"backup_directory": backupDir,
+				"backups":          []interface{}{},
+				"count":            0,
+			}, nil
+		}
+
+		text := fmt.Sprintf("Found %d backup files in %s:\n", len(backups), backupDir)
+		for _, backup := range backups {
+			text += fmt.Sprintf("- %s (Size: %s, Modified: %s)\n",
+				backup.Name,
+				formatBytes(backup.Size),
+				backup.ModTime.Format("2006-01-02 15:04:05"))
+		}
+
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: text},
+			},
+		}, map[string]interface{}{
+			"backup_directory": backupDir,
+			"backups":          backups,
+			"count":            len(backups),
+		}, nil
+	})
+
+	// Validate Backup tool
+	type validateBackupArgs struct {
+		BackupPath string `json:"backup_path" jsonschema:"Path to the backup file to validate"`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "validate_database_backup",
+		Description: "Validate that a backup file is valid and contains expected data",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args validateBackupArgs) (*mcp.CallToolResult, any, error) {
+		backupService := backup.New(db)
+
+		if err := backupService.ValidateBackup(args.BackupPath); err != nil {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{
+						Text: fmt.Sprintf("Backup validation failed: %s", err.Error()),
+					},
+				},
+			}, map[string]interface{}{
+				"backup_path": args.BackupPath,
+				"valid":       false,
+				"error":       err.Error(),
+			}, nil
+		}
+
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{
+					Text: fmt.Sprintf("Backup file is valid: %s", args.BackupPath),
+				},
+			},
+		}, map[string]interface{}{
+			"backup_path": args.BackupPath,
+			"valid":       true,
+		}, nil
+	})
+
+	// List Ready to Bill Contracts tool
+	type listReadyToBillArgs struct {
+		ClientName string `json:"client_name,omitempty" jsonschema:"Filter by client name (optional)"`
+		AutoOnly   bool   `json:"auto_only,omitempty" jsonschema:"Show only contracts with auto-billing enabled"`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "list_contracts_ready_for_billing",
+		Description: "List contracts that are ready to be billed based on their billing cycles",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args listReadyToBillArgs) (*mcp.CallToolResult, any, error) {
+		query := `
+			SELECT c.id, c.contract_number, c.name, c.hourly_rate, c.currency, c.contract_type,
+			       c.start_date, c.end_date, c.status, c.payment_terms, cl.name as client_name,
+			       c.billing_cycle_day, c.billing_cycle_type, c.next_billing_date, c.auto_bill_enabled
+			FROM contracts c
+			JOIN clients cl ON c.client_id = cl.id
+			WHERE c.status = 'active'
+			  AND c.billing_cycle_day IS NOT NULL
+			  AND c.next_billing_date IS NOT NULL
+			  AND c.next_billing_date <= date('now')
+		`
+		queryArgs := []interface{}{}
+
+		// Filter by client if specified
+		if args.ClientName != "" {
+			query += " AND cl.name LIKE ?"
+			queryArgs = append(queryArgs, "%"+args.ClientName+"%")
+		}
+
+		// Filter by auto-bill enabled if specified
+		if args.AutoOnly {
+			query += " AND c.auto_bill_enabled = 1"
+		}
+
+		query += " ORDER BY c.next_billing_date ASC, cl.name"
+
+		rows, err := db.Query(query, queryArgs...)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to query ready-to-bill contracts: %w", err)
+		}
+		defer rows.Close()
+
+		var contracts []models.Contract
+		for rows.Next() {
+			var contract models.Contract
+			var clientName string
+			var endDate *string
+			var billingCycleDay *int
+			var billingCycleType string
+			var nextBillingDate *string
+			var autoBillEnabled bool
+
+			err := rows.Scan(&contract.ID, &contract.ContractNumber, &contract.Name, &contract.HourlyRate, &contract.Currency, &contract.ContractType,
+				&contract.StartDate, &endDate, &contract.Status, &contract.PaymentTerms, &clientName,
+				&billingCycleDay, &billingCycleType, &nextBillingDate, &autoBillEnabled)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to scan contract: %w", err)
+			}
+
+			if endDate != nil {
+				ed, _ := time.Parse("2006-01-02", *endDate)
+				contract.EndDate = &ed
+			}
+
+			if nextBillingDate != nil {
+				nbd, _ := time.Parse("2006-01-02", *nextBillingDate)
+				contract.NextBillingDate = &nbd
+			}
+
+			contract.BillingCycleDay = billingCycleDay
+			contract.BillingCycleType = billingCycleType
+			contract.AutoBillEnabled = autoBillEnabled
+			contract.Client = &models.Client{Name: clientName}
+			contracts = append(contracts, contract)
+		}
+
+		if len(contracts) == 0 {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: "No contracts are ready to be billed."},
+				},
+			}, map[string]interface{}{
+				"contracts": []interface{}{},
+				"count":     0,
+			}, nil
+		}
+
+		// Build response text
+		text := fmt.Sprintf("Found %d contracts ready to be billed:\n\n", len(contracts))
+		for _, contract := range contracts {
+			daysOverdue := int(time.Since(*contract.NextBillingDate).Hours() / 24)
+			overdueText := ""
+			if daysOverdue > 0 {
+				overdueText = fmt.Sprintf(" (%d days overdue)", daysOverdue)
+			}
+
+			text += fmt.Sprintf("• %s: %s (%s)\n", contract.ContractNumber, contract.Name, contract.Client.Name)
+			text += fmt.Sprintf("  Rate: %s%.2f/%s\n", contract.Currency, contract.HourlyRate, contract.Currency)
+			text += fmt.Sprintf("  Billing: %s on day %d", contract.BillingCycleType, *contract.BillingCycleDay)
+			if contract.AutoBillEnabled {
+				text += " (auto-billing enabled)"
+			}
+			text += "\n"
+			text += fmt.Sprintf("  Due date: %s%s\n", contract.NextBillingDate.Format("2006-01-02"), overdueText)
+			text += "\n"
+		}
+
+		// Summary statistics
+		autoContracts := 0
+		overdueContracts := 0
+		for _, contract := range contracts {
+			if contract.AutoBillEnabled {
+				autoContracts++
+			}
+			if contract.NextBillingDate.Before(time.Now()) {
+				overdueContracts++
+			}
+		}
+
+		text += fmt.Sprintf("Summary: %d total, %d with auto-billing, %d overdue", len(contracts), autoContracts, overdueContracts)
+
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: text},
+			},
+		}, map[string]interface{}{
+			"contracts":        contracts,
+			"count":            len(contracts),
+			"auto_contracts":   autoContracts,
+			"overdue_contracts": overdueContracts,
+		}, nil
+	})
+
+	// Calculate Billing Period tool
+	type calculateBillingPeriodArgs struct {
+		ContractNumber string `json:"contract_number" jsonschema:"Contract number to calculate billing period for"`
+		ReferenceDate  string `json:"reference_date,omitempty" jsonschema:"Reference date (YYYY-MM-DD, defaults to today)"`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "calculate_billing_period",
+		Description: "Calculate the billing period for a contract based on its billing cycle",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args calculateBillingPeriodArgs) (*mcp.CallToolResult, any, error) {
+		// Get contract details
+		query := `
+			SELECT c.id, c.contract_number, c.name, c.start_date, c.billing_cycle_day, c.billing_cycle_type, cl.name
+			FROM contracts c
+			JOIN clients cl ON c.client_id = cl.id
+			WHERE c.contract_number = ? AND c.status = 'active'
+		`
+
+		var contract models.Contract
+		var clientName string
+		var billingCycleDay *int
+		var billingCycleType string
+
+		err := db.QueryRow(query, args.ContractNumber).Scan(
+			&contract.ID, &contract.ContractNumber, &contract.Name, &contract.StartDate,
+			&billingCycleDay, &billingCycleType, &clientName)
+
+		if err == sql.ErrNoRows {
+			return nil, nil, fmt.Errorf("contract %s not found or not active", args.ContractNumber)
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to query contract: %w", err)
+		}
+
+		if billingCycleDay == nil {
+			return nil, nil, fmt.Errorf("contract %s does not have a billing cycle configured", args.ContractNumber)
+		}
+
+		contract.BillingCycleDay = billingCycleDay
+		contract.BillingCycleType = billingCycleType
+		contract.Client = &models.Client{Name: clientName}
+
+		// Parse reference date
+		referenceDate := time.Now()
+		if args.ReferenceDate != "" {
+			rd, err := time.Parse("2006-01-02", args.ReferenceDate)
+			if err != nil {
+				return nil, nil, fmt.Errorf("invalid reference date format: %w", err)
+			}
+			referenceDate = rd
+		}
+
+		// Calculate billing period
+		period, err := billing.CalculateBillingPeriod(contract, referenceDate)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to calculate billing period: %w", err)
+		}
+
+		text := fmt.Sprintf("Billing period for contract %s (%s):\n", args.ContractNumber, contract.Name)
+		text += fmt.Sprintf("Client: %s\n", clientName)
+		text += fmt.Sprintf("Billing cycle: %s on day %d\n", billingCycleType, *billingCycleDay)
+		text += fmt.Sprintf("Period: %s to %s\n", period.StartDate.Format("2006-01-02"), period.EndDate.Format("2006-01-02"))
+		text += fmt.Sprintf("Reference date: %s", referenceDate.Format("2006-01-02"))
+
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: text},
+			},
+		}, map[string]interface{}{
+			"contract_number": args.ContractNumber,
+			"contract_name":   contract.Name,
+			"client_name":     clientName,
+			"period_start":    period.StartDate.Format("2006-01-02"),
+			"period_end":      period.EndDate.Format("2006-01-02"),
+			"cycle_type":      billingCycleType,
+			"cycle_day":       *billingCycleDay,
+			"reference_date":  referenceDate.Format("2006-01-02"),
+		}, nil
+	})
+
+	registerExpenseTools(server, db, h)
+}
+
+func registerExpenseTools(server *mcp.Server, db *sql.DB, h *Handler) {
+	type addExpenseArgs struct {
+		ClientName     string  `json:"client_name" jsonschema:"Client name"`
+		Date           string  `json:"date" jsonschema:"Expense date (YYYY-MM-DD or natural language like 'today', 'yesterday')"`
+		Description    string  `json:"description" jsonschema:"Expense description"`
+		Amount         float64 `json:"amount" jsonschema:"Expense amount"`
+		Currency       string  `json:"currency,omitempty" jsonschema:"Currency code (default: USD)"`
+		Category       string  `json:"category,omitempty" jsonschema:"Optional category (e.g. travel, software, meals)"`
+		ContractNumber string  `json:"contract_number,omitempty" jsonschema:"Optional contract number to associate with"`
+		ReceiptPath    string  `json:"receipt_path,omitempty" jsonschema:"Optional path to receipt file"`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "add_expense",
+		Description: "Add a billable expense for a client (will be included in next invoice)",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args addExpenseArgs) (*mcp.CallToolResult, any, error) {
+		if args.Amount <= 0 {
+			return nil, nil, fmt.Errorf("amount must be greater than 0")
+		}
+		if strings.TrimSpace(args.Description) == "" {
+			return nil, nil, fmt.Errorf("description is required")
+		}
+		if args.Currency == "" {
+			args.Currency = "USD"
+		}
+
+		clientID, err := h.getClientIDByName(args.ClientName)
+		if err != nil {
+			return nil, nil, fmt.Errorf("client not found: %w", err)
+		}
+
+		date, err := timeparse.ParseDate(args.Date)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid date: %w", err)
+		}
+
+		var contractID *int
+		if args.ContractNumber != "" {
+			var cid int
+			err := db.QueryRow(`SELECT id FROM contracts WHERE contract_number = ? AND client_id = ?`,
+				args.ContractNumber, clientID).Scan(&cid)
+			if err == sql.ErrNoRows {
+				return nil, nil, fmt.Errorf("contract %s not found for client %s", args.ContractNumber, args.ClientName)
+			} else if err != nil {
+				return nil, nil, fmt.Errorf("failed to look up contract: %w", err)
+			}
+			contractID = &cid
+		}
+
+		id := uuid.New().String()
+		_, err = db.Exec(`
+			INSERT INTO expenses (id, client_id, contract_id, date, description, amount, currency, category, receipt_path)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, id, clientID, contractID, date.Format("2006-01-02"), args.Description, args.Amount,
+			args.Currency, nullIfEmpty(args.Category), nullIfEmpty(args.ReceiptPath))
+
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to add expense: %w", err)
+		}
+
+		text := fmt.Sprintf("Expense added: %s %.2f - %s (%s)\nID: %s",
+			args.Currency, args.Amount, args.Description, date.Format("2006-01-02"), id)
+
+		return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: text}},
+			}, map[string]interface{}{
+				"id":          id,
+				"client_name": args.ClientName,
+				"date":        date.Format("2006-01-02"),
+				"amount":      args.Amount,
+				"currency":    args.Currency,
+				"description": args.Description,
+			}, nil
+	})
+
+	type listExpensesArgs struct {
+		ClientName string `json:"client_name,omitempty" jsonschema:"Filter by client name (optional)"`
+		Period     string `json:"period,omitempty" jsonschema:"Period filter (e.g. 'this month', 'last month', 'January 2025') (optional)"`
+		Invoiced   *bool  `json:"invoiced,omitempty" jsonschema:"Filter by invoice status: true=invoiced, false=unbilled (optional)"`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "list_expenses",
+		Description: "List expenses with optional filtering by client, period, and invoice status",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args listExpensesArgs) (*mcp.CallToolResult, any, error) {
+		query := `
+			SELECT e.id, e.client_id, e.contract_id, e.date, e.description, e.amount, e.currency,
+			       COALESCE(e.category, ''), COALESCE(e.receipt_path, ''), e.invoice_id, c.name
+			FROM expenses e
+			JOIN clients c ON e.client_id = c.id
+			WHERE 1=1
+		`
+		var params []interface{}
+
+		if args.ClientName != "" {
+			clientID, err := h.getClientIDByName(args.ClientName)
+			if err != nil {
+				return nil, nil, fmt.Errorf("client not found: %w", err)
+			}
+			query += " AND e.client_id = ?"
+			params = append(params, clientID)
+		}
+
+		if args.Period != "" {
+			startDate, endDate, err := timeparse.ParsePeriod(args.Period)
+			if err != nil {
+				return nil, nil, fmt.Errorf("invalid period: %w", err)
+			}
+			query += " AND e.date >= ? AND e.date <= ?"
+			params = append(params, startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
+		}
+
+		if args.Invoiced != nil {
+			if *args.Invoiced {
+				query += " AND e.invoice_id IS NOT NULL"
+			} else {
+				query += " AND e.invoice_id IS NULL"
+			}
+		}
+
+		query += " ORDER BY e.date DESC"
+
+		rows, err := db.Query(query, params...)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to list expenses: %w", err)
+		}
+		defer rows.Close()
+
+		type expenseRow struct {
+			models.Expense
+			ClientName string `json:"client_name"`
+		}
+
+		var results []expenseRow
+		var totalAmount float64
+		for rows.Next() {
+			var e expenseRow
+			if err := rows.Scan(&e.ID, &e.ClientID, &e.ContractID, &e.Date, &e.Description,
+				&e.Amount, &e.Currency, &e.Category, &e.ReceiptPath, &e.InvoiceID, &e.ClientName); err != nil {
+				return nil, nil, fmt.Errorf("failed to scan expense: %w", err)
+			}
+			results = append(results, e)
+			totalAmount += e.Amount
+		}
+
+		text := fmt.Sprintf("Found %d expenses (total: %.2f)\n", len(results), totalAmount)
+		for _, e := range results {
+			status := "unbilled"
+			if e.InvoiceID != nil {
+				status = fmt.Sprintf("invoiced #%d", *e.InvoiceID)
+			}
+			cat := ""
+			if e.Category != "" {
+				cat = fmt.Sprintf(" [%s]", e.Category)
+			}
+			text += fmt.Sprintf("- %s | %s | %s%s | %s %.2f | %s | %s\n",
+				e.ID[:8], e.Date.Format("2006-01-02"), e.ClientName, cat,
+				e.Currency, e.Amount, e.Description, status)
+		}
+
+		return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: text}},
+			}, map[string]interface{}{
+				"expenses":     results,
+				"count":        len(results),
+				"total_amount": totalAmount,
+			}, nil
+	})
+
+	type updateExpenseArgs struct {
+		ID          string   `json:"id" jsonschema:"Expense UUID"`
+		Date        string   `json:"date,omitempty" jsonschema:"New date (optional)"`
+		Description string   `json:"description,omitempty" jsonschema:"New description (optional)"`
+		Amount      *float64 `json:"amount,omitempty" jsonschema:"New amount (optional)"`
+		Currency    string   `json:"currency,omitempty" jsonschema:"New currency (optional)"`
+		Category    string   `json:"category,omitempty" jsonschema:"New category (optional)"`
+		ReceiptPath string   `json:"receipt_path,omitempty" jsonschema:"New receipt path (optional)"`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "update_expense",
+		Description: "Update an unbilled expense",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args updateExpenseArgs) (*mcp.CallToolResult, any, error) {
+		var invoiceID *int
+		err := db.QueryRow(`SELECT invoice_id FROM expenses WHERE id = ?`, args.ID).Scan(&invoiceID)
+		if err == sql.ErrNoRows {
+			return nil, nil, fmt.Errorf("expense %s not found", args.ID)
+		} else if err != nil {
+			return nil, nil, fmt.Errorf("failed to look up expense: %w", err)
+		}
+		if invoiceID != nil {
+			return nil, nil, fmt.Errorf("cannot update expense that has already been invoiced")
+		}
+
+		var setClauses []string
+		var params []interface{}
+
+		if args.Date != "" {
+			date, err := timeparse.ParseDate(args.Date)
+			if err != nil {
+				return nil, nil, fmt.Errorf("invalid date: %w", err)
+			}
+			setClauses = append(setClauses, "date = ?")
+			params = append(params, date.Format("2006-01-02"))
+		}
+		if args.Description != "" {
+			setClauses = append(setClauses, "description = ?")
+			params = append(params, args.Description)
+		}
+		if args.Amount != nil {
+			if *args.Amount <= 0 {
+				return nil, nil, fmt.Errorf("amount must be greater than 0")
+			}
+			setClauses = append(setClauses, "amount = ?")
+			params = append(params, *args.Amount)
+		}
+		if args.Currency != "" {
+			setClauses = append(setClauses, "currency = ?")
+			params = append(params, args.Currency)
+		}
+		if args.Category != "" {
+			setClauses = append(setClauses, "category = ?")
+			params = append(params, args.Category)
+		}
+		if args.ReceiptPath != "" {
+			setClauses = append(setClauses, "receipt_path = ?")
+			params = append(params, args.ReceiptPath)
+		}
+
+		if len(setClauses) == 0 {
+			return nil, nil, fmt.Errorf("no fields provided to update")
+		}
+
+		params = append(params, args.ID)
+		query := "UPDATE expenses SET " + strings.Join(setClauses, ", ") + " WHERE id = ?"
+		if _, err := db.Exec(query, params...); err != nil {
+			return nil, nil, fmt.Errorf("failed to update expense: %w", err)
+		}
+
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Expense %s updated", args.ID)}},
+		}, map[string]interface{}{"id": args.ID}, nil
+	})
+
+	type deleteExpenseArgs struct {
+		ID string `json:"id" jsonschema:"Expense UUID to delete"`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "delete_expense",
+		Description: "Delete an unbilled expense",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args deleteExpenseArgs) (*mcp.CallToolResult, any, error) {
+		var invoiceID *int
+		err := db.QueryRow(`SELECT invoice_id FROM expenses WHERE id = ?`, args.ID).Scan(&invoiceID)
+		if err == sql.ErrNoRows {
+			return nil, nil, fmt.Errorf("expense %s not found", args.ID)
+		} else if err != nil {
+			return nil, nil, fmt.Errorf("failed to look up expense: %w", err)
+		}
+		if invoiceID != nil {
+			return nil, nil, fmt.Errorf("cannot delete expense that has already been invoiced (unmark from invoice first)")
+		}
+
+		if _, err := db.Exec(`DELETE FROM expenses WHERE id = ?`, args.ID); err != nil {
+			return nil, nil, fmt.Errorf("failed to delete expense: %w", err)
+		}
+
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Expense %s deleted", args.ID)}},
+		}, map[string]interface{}{"id": args.ID}, nil
+	})
+}
+
+func nullIfEmpty(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 type Handler struct {
@@ -1916,4 +2762,27 @@ func (h *Handler) getClientIDByName(name string) (int, error) {
 		return 0, fmt.Errorf("client '%s' not found", name)
 	}
 	return id, err
+}
+
+// isDirectory checks if a path is a directory
+func isDirectory(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
+}
+
+// formatBytes formats byte size in a human-readable format
+func formatBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }

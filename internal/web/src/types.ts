@@ -24,6 +24,7 @@ export interface Contract {
   end_date?: string | null
   status: string
   payment_terms?: string
+  payment_method_id?: number | null
   notes?: string
   created_at: string
   updated_at: string
@@ -49,6 +50,31 @@ export interface PaymentDetails {
   payment_terms?: string
   notes?: string
   updated_at: string
+}
+
+export interface PaymentMethod {
+  id: number
+  label: string
+  bank_name?: string
+  account_number?: string
+  routing_number?: string
+  swift_code?: string
+  payment_terms?: string
+  notes?: string
+  is_default: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface PaymentMethodInput {
+  label: string
+  bank_name?: string
+  account_number?: string
+  routing_number?: string
+  swift_code?: string
+  payment_terms?: string
+  notes?: string
+  is_default?: boolean
 }
 
 export interface TimeEntry {
@@ -85,7 +111,49 @@ export interface Invoice {
 export interface InvoiceDetails {
   invoice: Invoice
   time_entries: TimeEntry[]
+  expenses: Expense[]
   total_hours: number
+  total_expenses: number
+}
+
+export interface Expense {
+  id: string
+  client_id: number
+  client_name: string
+  contract_id?: number | null
+  contract_number?: string
+  date: string
+  description: string
+  amount: number
+  currency: string
+  category?: string
+  receipt_path?: string
+  invoice_id?: number | null
+  invoice_number?: string
+  created_at: string
+}
+
+export interface ExpenseInput {
+  client_id: number
+  contract_id?: number | null
+  contract_number?: string
+  date: string
+  description: string
+  amount: number
+  currency?: string
+  category?: string
+  receipt_path?: string
+}
+
+export interface InvoicePreview {
+  invoice: Invoice
+  client: Client
+  contracts: Contract[]
+  time_entries: TimeEntry[]
+  total_hours: number
+  payment: PaymentDetails
+  recipients: Recipient[]
+  business: BusinessInfo
 }
 
 export interface QuoteLineItem {
@@ -140,6 +208,17 @@ export interface BusinessInfo {
   invoice_prefix?: string
   export_path?: string
   updated_at: string
+}
+
+// AuthState mirrors GET /api/me. When auth is disabled by the server the
+// payload is `{ auth_enabled: false }`; otherwise it's a fully populated
+// user record (or 401 when no session is present).
+export interface AuthState {
+  auth_enabled?: boolean
+  id?: number
+  email?: string
+  name?: string
+  role?: 'admin' | 'user' | string
 }
 
 export interface Stats {

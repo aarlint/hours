@@ -155,6 +155,20 @@ func createTables(db *sql.DB) error {
 		FOREIGN KEY (quote_id) REFERENCES quotes(id) ON DELETE CASCADE
 	);
 
+	CREATE TABLE IF NOT EXISTS payment_methods (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		label TEXT NOT NULL,
+		bank_name TEXT,
+		account_number TEXT,
+		routing_number TEXT,
+		swift_code TEXT,
+		payment_terms TEXT,
+		notes TEXT,
+		is_default BOOLEAN DEFAULT FALSE,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
 	CREATE TABLE IF NOT EXISTS business_info (
 		id INTEGER PRIMARY KEY,
 		business_name TEXT NOT NULL,
@@ -174,6 +188,23 @@ func createTables(db *sql.DB) error {
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
+	CREATE TABLE IF NOT EXISTS expenses (
+		id TEXT PRIMARY KEY,
+		client_id INTEGER NOT NULL,
+		contract_id INTEGER,
+		date DATE NOT NULL,
+		description TEXT NOT NULL,
+		amount REAL NOT NULL,
+		currency TEXT DEFAULT 'USD',
+		category TEXT,
+		receipt_path TEXT,
+		invoice_id INTEGER,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE,
+		FOREIGN KEY (contract_id) REFERENCES contracts(id),
+		FOREIGN KEY (invoice_id) REFERENCES invoices(id)
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_time_entries_date ON time_entries(date);
 	CREATE INDEX IF NOT EXISTS idx_time_entries_client ON time_entries(client_id);
 	CREATE INDEX IF NOT EXISTS idx_invoices_client ON invoices(client_id);
@@ -184,6 +215,9 @@ func createTables(db *sql.DB) error {
 	CREATE INDEX IF NOT EXISTS idx_quotes_client ON quotes(client_id);
 	CREATE INDEX IF NOT EXISTS idx_quotes_status ON quotes(status);
 	CREATE INDEX IF NOT EXISTS idx_quote_line_items_quote ON quote_line_items(quote_id);
+	CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
+	CREATE INDEX IF NOT EXISTS idx_expenses_client ON expenses(client_id);
+	CREATE INDEX IF NOT EXISTS idx_expenses_invoice ON expenses(invoice_id);
 	`
 
 	if _, err := db.Exec(schema); err != nil {
@@ -259,6 +293,36 @@ func runMigrations(db *sql.DB) error {
 			name: "add_export_path_to_business_info",
 			apply: func(db *sql.DB) error {
 				return addColumnIfNotExists(db, "business_info", "export_path", "TEXT")
+			},
+		},
+		{
+			name: "add_payment_method_to_contracts",
+			apply: func(db *sql.DB) error {
+				return addColumnIfNotExists(db, "contracts", "payment_method_id", "INTEGER")
+			},
+		},
+		{
+			name: "add_payment_method_to_invoices",
+			apply: func(db *sql.DB) error {
+				return addColumnIfNotExists(db, "invoices", "payment_method_id", "INTEGER")
+			},
+		},
+		{
+			name: "migrate_payment_details_to_payment_methods",
+			apply: func(db *sql.DB) error {
+				return migratePaymentDetailsToMethods(db)
+			},
+		},
+		{
+			name: "add_billing_cycles_to_contracts",
+			apply: func(db *sql.DB) error {
+				return addBillingCyclesToContracts(db)
+			},
+		},
+		{
+			name: "add_users_table",
+			apply: func(db *sql.DB) error {
+				return addUsersTable(db)
 			},
 		},
 	}
@@ -495,5 +559,170 @@ func removeRateConstraintsFromClients(db *sql.DB) error {
 	}
 
 	fmt.Println("Successfully removed rate constraints from clients table")
+	return nil
+}
+
+// migratePaymentDetailsToMethods lifts every legacy per-client payment_details
+// row into a business-level payment_methods entry and points each contract
+// belonging to that client at the new method. Existing invoices keep their
+// data flow (they read through contracts now) so nothing on disk changes.
+//
+// Labels use the client name so the user can immediately recognise methods
+// in the Settings UI and rename/consolidate them there.
+func migratePaymentDetailsToMethods(db *sql.DB) error {
+	// Nothing to do unless the legacy table exists.
+	var tblName string
+	err := db.QueryRow(
+		`SELECT name FROM sqlite_master WHERE type='table' AND name='payment_details'`,
+	).Scan(&tblName)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("check legacy payment_details: %w", err)
+	}
+
+	rows, err := db.Query(`
+		SELECT pd.client_id, c.name,
+		       COALESCE(pd.bank_name,''), COALESCE(pd.account_number,''),
+		       COALESCE(pd.routing_number,''), COALESCE(pd.swift_code,''),
+		       COALESCE(pd.payment_terms,''), COALESCE(pd.notes,'')
+		FROM payment_details pd
+		JOIN clients c ON c.id = pd.client_id
+	`)
+	if err != nil {
+		return fmt.Errorf("scan legacy payment_details: %w", err)
+	}
+	defer rows.Close()
+
+	type legacy struct {
+		clientID                                        int
+		clientName, bank, acct, routing, swift, terms, notes string
+	}
+	var batch []legacy
+	for rows.Next() {
+		var l legacy
+		if err := rows.Scan(&l.clientID, &l.clientName, &l.bank, &l.acct, &l.routing,
+			&l.swift, &l.terms, &l.notes); err != nil {
+			return err
+		}
+		batch = append(batch, l)
+	}
+	if len(batch) == 0 {
+		return nil
+	}
+
+	fmt.Printf("Migrating %d legacy per-client payment_details into business-level payment_methods...\n", len(batch))
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for i, l := range batch {
+		label := fmt.Sprintf("%s (migrated)", l.clientName)
+		isDefault := i == 0 // first one becomes the default method
+		var methodID int64
+		if err := tx.QueryRow(`
+			INSERT INTO payment_methods (label, bank_name, account_number, routing_number,
+			                             swift_code, payment_terms, notes, is_default)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			RETURNING id
+		`, label, l.bank, l.acct, l.routing, l.swift, l.terms, l.notes, isDefault).Scan(&methodID); err != nil {
+			return fmt.Errorf("insert payment_method for %s: %w", l.clientName, err)
+		}
+		if _, err := tx.Exec(`
+			UPDATE contracts SET payment_method_id = ?
+			WHERE client_id = ? AND payment_method_id IS NULL
+		`, methodID, l.clientID); err != nil {
+			return fmt.Errorf("attach payment_method to contracts for %s: %w", l.clientName, err)
+		}
+		// Snapshot the same method onto any past invoices so the PDF
+		// regenerate path keeps working identically.
+		if _, err := tx.Exec(`
+			UPDATE invoices SET payment_method_id = ?
+			WHERE client_id = ? AND payment_method_id IS NULL
+		`, methodID, l.clientID); err != nil {
+			return fmt.Errorf("attach payment_method to invoices for %s: %w", l.clientName, err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// addUsersTable creates the users + sessions tables used by the OIDC auth
+// layer. The serve mode requires auth when OIDC env vars are set; users are
+// auto-provisioned on first sign-in. Wails GUI bypasses both tables — they
+// only matter on the network-exposed HTTP path.
+func addUsersTable(db *sql.DB) error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS users (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			oidc_subject TEXT NOT NULL UNIQUE,
+			email TEXT NOT NULL,
+			name TEXT,
+			role TEXT NOT NULL DEFAULT 'user',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			last_login_at DATETIME
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)`,
+		`CREATE TABLE IF NOT EXISTS sessions (
+			token TEXT PRIMARY KEY,
+			user_id INTEGER NOT NULL,
+			expires_at DATETIME NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)`,
+	}
+	for _, s := range stmts {
+		if _, err := db.Exec(s); err != nil {
+			return fmt.Errorf("create users/sessions: %w", err)
+		}
+	}
+	return nil
+}
+
+func addBillingCyclesToContracts(db *sql.DB) error {
+	fmt.Println("Adding billing cycle support to contracts table...")
+
+	// Add billing cycle columns
+	if err := addColumnIfNotExists(db, "contracts", "billing_cycle_day", "INTEGER"); err != nil {
+		return fmt.Errorf("failed to add billing_cycle_day column: %w", err)
+	}
+
+	if err := addColumnIfNotExists(db, "contracts", "billing_cycle_type", "TEXT DEFAULT 'monthly'"); err != nil {
+		return fmt.Errorf("failed to add billing_cycle_type column: %w", err)
+	}
+
+	if err := addColumnIfNotExists(db, "contracts", "next_billing_date", "DATE"); err != nil {
+		return fmt.Errorf("failed to add next_billing_date column: %w", err)
+	}
+
+	if err := addColumnIfNotExists(db, "contracts", "auto_bill_enabled", "BOOLEAN DEFAULT FALSE"); err != nil {
+		return fmt.Errorf("failed to add auto_bill_enabled column: %w", err)
+	}
+
+	// Set default billing cycle type for existing contracts
+	_, err := db.Exec(`
+		UPDATE contracts
+		SET billing_cycle_type = 'monthly'
+		WHERE billing_cycle_type IS NULL OR billing_cycle_type = ''
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to set default billing cycle type: %w", err)
+	}
+
+	// Add index for billing date queries
+	_, err = db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_contracts_billing_date ON contracts(next_billing_date, status)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create billing date index: %w", err)
+	}
+
+	fmt.Println("Successfully added billing cycle support to contracts")
 	return nil
 }

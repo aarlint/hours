@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { RouterView, useRoute, useRouter } from 'vue-router'
 import { computed, onMounted, ref, watch } from 'vue'
-import type { Client, Contract, BusinessInfo } from './types'
+import type { Client, Contract, BusinessInfo, AuthState } from './types'
 import { api } from './api'
 import { useToasts } from './composables/useToasts'
 import { onRealtime, startRealtime, useRealtimeStatus, changeTick, isOwn } from './composables/useRealtime'
@@ -32,17 +32,38 @@ const clients = ref<Client[]>([])
 const contracts = ref<Contract[]>([])
 const business = ref<BusinessInfo | null>(null)
 const expanded = ref<Record<number, boolean>>({})
+const authState = ref<AuthState | null>(null)
+// authActive means the server has OIDC wired up *and* the current request
+// is authenticated. Wails (and serve mode without OIDC env vars) returns
+// `auth_enabled: false` here, in which case we hide the user/logout chip.
+const authActive = computed(() =>
+  !!authState.value && authState.value.auth_enabled !== false && !!authState.value.email,
+)
+const userInitial = computed(() => {
+  const e = authState.value?.email ?? ''
+  return e ? e[0].toUpperCase() : '·'
+})
+
+async function logout() {
+  try {
+    await api.logout()
+  } catch {}
+  // Drop client-side state and bounce through the login page.
+  window.location.href = '/auth/login'
+}
 
 async function loadSidebar() {
   try {
-    const [cs, ks, bi] = await Promise.all([
+    const [cs, ks, bi, me] = await Promise.all([
       api.listClients(),
       api.listContracts(),
       api.getBusinessInfo().catch(() => null),
+      api.me().catch(() => null),
     ])
     clients.value = cs
     contracts.value = ks
     business.value = bi
+    authState.value = me
   } catch {}
 }
 
@@ -59,6 +80,7 @@ const showRightRail = computed(() => route.name === 'dashboard')
 const nav = [
   { to: '/dashboard', label: 'Dashboard' },
   { to: '/time', label: 'Time log' },
+  { to: '/expenses', label: 'Expenses' },
   { to: '/quotes', label: 'Quotes' },
   { to: '/invoices', label: 'Invoices' },
   { to: '/clients', label: 'Clients' },
@@ -191,6 +213,14 @@ useShortcuts([
         <div class="biz-name">{{ business?.business_name ?? 'Business' }}</div>
         <div class="biz-meta">{{ business?.email ?? 'Set in Settings' }}</div>
         <RouterLink to="/settings" class="biz-settings">Settings →</RouterLink>
+        <div v-if="authActive" class="user-chip">
+          <span class="user-avatar" :title="authState?.email ?? ''">{{ userInitial }}</span>
+          <div class="user-meta">
+            <div class="user-name">{{ authState?.name || authState?.email }}</div>
+            <div class="user-role">{{ authState?.role ?? 'user' }}</div>
+          </div>
+          <button class="user-logout" @click="logout" title="Sign out">↩</button>
+        </div>
       </div>
     </aside>
 
@@ -420,6 +450,53 @@ useShortcuts([
   font-size: 11px;
   color: var(--accent);
 }
+
+.user-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 0.5px solid var(--rule);
+}
+.user-avatar {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--selected);
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.user-meta { flex: 1; min-width: 0; }
+.user-name {
+  font-size: 11.5px;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.user-role {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.user-logout {
+  background: transparent;
+  border: 0.5px solid var(--rule);
+  color: var(--ink-3);
+  border-radius: 4px;
+  width: 22px;
+  height: 22px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.user-logout:hover { color: var(--ink); }
 
 /* ---------- Main / Topbar ---------- */
 .main {
