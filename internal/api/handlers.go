@@ -1041,9 +1041,11 @@ func (h *handlers) listInvoices(w http.ResponseWriter, r *http.Request) (interfa
 }
 
 type invoiceDetailsResponse struct {
-	Invoice     invoiceDTO     `json:"invoice"`
-	TimeEntries []timeEntryDTO `json:"time_entries"`
-	TotalHours  float64        `json:"total_hours"`
+	Invoice       invoiceDTO     `json:"invoice"`
+	TimeEntries   []timeEntryDTO `json:"time_entries"`
+	Expenses      []expenseRow   `json:"expenses"`
+	TotalHours    float64        `json:"total_hours"`
+	TotalExpenses float64        `json:"total_expenses"`
 }
 
 func (h *handlers) getInvoiceDetails(w http.ResponseWriter, r *http.Request) (interface{}, error) {
@@ -1080,7 +1082,46 @@ func (h *handlers) getInvoiceDetails(w http.ResponseWriter, r *http.Request) (in
 	for _, e := range entries {
 		total += e.Hours
 	}
-	return invoiceDetailsResponse{Invoice: inv, TimeEntries: entries, TotalHours: total}, nil
+
+	expRows, err := h.db.Query(`
+		SELECT e.id, e.client_id, c.name, e.contract_id, COALESCE(ct.contract_number,''),
+		       e.date, e.description, e.amount, e.currency,
+		       COALESCE(e.category,''), COALESCE(e.receipt_path,''),
+		       e.invoice_id, COALESCE(i.invoice_number,''), e.created_at
+		FROM expenses e
+		JOIN clients c ON c.id = e.client_id
+		LEFT JOIN contracts ct ON ct.id = e.contract_id
+		LEFT JOIN invoices i ON i.id = e.invoice_id
+		WHERE e.invoice_id = ?
+		ORDER BY e.date
+	`, inv.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer expRows.Close()
+	expenses := []expenseRow{}
+	totalExpenses := 0.0
+	for expRows.Next() {
+		var e expenseRow
+		var date, created time.Time
+		if err := expRows.Scan(&e.ID, &e.ClientID, &e.ClientName, &e.ContractID, &e.ContractNumber,
+			&date, &e.Description, &e.Amount, &e.Currency, &e.Category, &e.ReceiptPath,
+			&e.InvoiceID, &e.InvoiceNumber, &created); err != nil {
+			return nil, err
+		}
+		e.Date = date.Format("2006-01-02")
+		e.CreatedAt = created.Format(time.RFC3339)
+		expenses = append(expenses, e)
+		totalExpenses += e.Amount
+	}
+
+	return invoiceDetailsResponse{
+		Invoice:       inv,
+		TimeEntries:   entries,
+		Expenses:      expenses,
+		TotalHours:    total,
+		TotalExpenses: totalExpenses,
+	}, nil
 }
 
 // invoicePreviewResponse is the render-ready payload for the HTML preview.

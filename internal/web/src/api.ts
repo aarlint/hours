@@ -1,7 +1,10 @@
 import type {
+  AuthState,
   BusinessInfo,
   Client,
   Contract,
+  Expense,
+  ExpenseInput,
   Invoice,
   InvoiceDetails,
   InvoicePreview,
@@ -47,7 +50,15 @@ async function request<T>(
     method,
     headers: body ? { 'Content-Type': 'application/json' } : undefined,
     body: body ? bodyStr : undefined,
+    credentials: 'same-origin',
   })
+  if (res.status === 401 && !path.startsWith('/api/me')) {
+    // Session expired or never started: kick the user to the login page so
+    // OIDC can re-stamp a cookie. The auth handler then redirects them back.
+    const here = window.location.pathname + window.location.search
+    window.location.href = `/auth/login?return=${encodeURIComponent(here)}`
+    throw new Error('not authenticated')
+  }
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`
     try {
@@ -222,6 +233,28 @@ export const api = {
       `/api/invoices/${encodeURIComponent(number)}/download`,
     ),
 
+  // Expenses
+  listExpenses: (params?: {
+    client_id?: number
+    invoiced?: 'true' | 'false'
+    start_date?: string
+    end_date?: string
+    category?: string
+  }) => {
+    const q = new URLSearchParams()
+    Object.entries(params ?? {}).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== '') q.set(k, String(v))
+    })
+    const qs = q.toString()
+    return request<Expense[]>('GET', '/api/expenses' + (qs ? '?' + qs : ''))
+  },
+  addExpense: (data: ExpenseInput) =>
+    request<{ id: string }>('POST', '/api/expenses', data),
+  updateExpense: (id: string, data: Partial<ExpenseInput>) =>
+    request<{ id: string }>('PUT', `/api/expenses/${id}`, data),
+  deleteExpense: (id: string) =>
+    request<{ deleted: string }>('DELETE', `/api/expenses/${id}`),
+
   // Quotes
   listQuotes: (params?: { client_id?: number; status?: string }) => {
     const q = new URLSearchParams()
@@ -298,6 +331,20 @@ export const api = {
       contract_number: string
       hourly_rate: number
     }>('POST', `/api/quotes/${encodeURIComponent(number)}/convert`, data),
+
+  // Auth
+  me: () => request<AuthState>('GET', '/api/me'),
+  logout: () => request<{ ok: true }>('POST', '/auth/logout'),
+
+  // Data export/import — exportData returns the parsed JSON object so the
+  // caller can either offer it as a download or post it back to /api/import.
+  exportData: () => request<unknown>('GET', '/api/export'),
+  importData: (payload: unknown) =>
+    request<{ ok: true; imported: Record<string, number> }>(
+      'POST',
+      '/api/import',
+      payload,
+    ),
 }
 
 export function formatCurrency(amount: number, currency = 'USD'): string {

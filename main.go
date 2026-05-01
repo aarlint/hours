@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/austin/hours-mcp/internal/api"
+	"github.com/austin/hours-mcp/internal/auth"
 	"github.com/austin/hours-mcp/internal/database"
 	"github.com/austin/hours-mcp/internal/server"
 	"github.com/austin/hours-mcp/internal/web"
@@ -64,7 +65,17 @@ func runMCP(db *sql.DB) {
 }
 
 func runHTTP(db *sql.DB, addr string) {
-	srv := api.NewServer(db, web.Assets())
+	a, err := auth.NewFromEnv(context.Background(), db)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "OIDC init failed: %v\n", err)
+		os.Exit(1)
+	}
+	if a.Enabled() {
+		fmt.Fprintln(os.Stderr, "OIDC auth enabled")
+	} else {
+		fmt.Fprintln(os.Stderr, "OIDC auth disabled (set OIDC_ISSUER/OIDC_CLIENT_ID/OIDC_REDIRECT_URL to enable)")
+	}
+	srv := api.NewServerWithAuth(db, web.Assets(), a)
 	if err := srv.ListenAndServe(addr); err != nil {
 		fmt.Fprintf(os.Stderr, "HTTP server error: %v\n", err)
 		os.Exit(1)

@@ -9,19 +9,30 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/austin/hours-mcp/internal/auth"
 )
 
 type Server struct {
 	db     *sql.DB
 	mux    *http.ServeMux
 	assets fs.FS
+	auth   *auth.Auth
 }
 
 func NewServer(db *sql.DB, assets fs.FS) *Server {
+	return NewServerWithAuth(db, assets, nil)
+}
+
+// NewServerWithAuth builds the server with an optional OIDC layer. Pass nil
+// (or use NewServer) for the unauthenticated path used by the Wails GUI and
+// by --serve when no OIDC env vars are set.
+func NewServerWithAuth(db *sql.DB, assets fs.FS, a *auth.Auth) *Server {
 	s := &Server{
 		db:     db,
 		mux:    http.NewServeMux(),
 		assets: assets,
+		auth:   a,
 	}
 	s.registerRoutes()
 	return s
@@ -44,77 +55,135 @@ func (s *Server) ListenAndServe(addr string) error {
 func (s *Server) registerRoutes() {
 	h := &handlers{db: s.db}
 
+	// Auth routes — registered before the auth middleware is attached
+	// so they remain reachable for unauthenticated visitors.
+	if s.auth.Enabled() {
+		s.mux.HandleFunc("GET /auth/login", s.auth.LoginHandler)
+		s.mux.HandleFunc("GET /auth/callback", s.auth.CallbackHandler)
+		s.mux.HandleFunc("POST /auth/logout", s.auth.LogoutHandler)
+	}
+
+	// API mux — wrapped with auth middleware below if enabled.
+	apiMux := http.NewServeMux()
+
+	if s.auth.Enabled() {
+		apiMux.HandleFunc("GET /api/me", s.auth.MeHandler)
+	} else {
+		// Always expose /api/me so the frontend can detect "auth disabled" mode.
+		apiMux.HandleFunc("GET /api/me", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"auth_enabled":false}`))
+		})
+	}
+
 	// Dashboard
-	s.mux.HandleFunc("GET /api/stats", jsonHandler(h.getStats))
+	apiMux.HandleFunc("GET /api/stats", jsonHandler(h.getStats))
 
 	// Server-Sent Events stream
-	s.mux.HandleFunc("GET /api/events", s.handleEvents)
+	apiMux.HandleFunc("GET /api/events", s.handleEvents)
 	InitEventBus(s.db)
 
 	// Business info
-	s.mux.HandleFunc("GET /api/business-info", jsonHandler(h.getBusinessInfo))
-	s.mux.HandleFunc("PUT /api/business-info", jsonHandler(h.setBusinessInfo))
+	apiMux.HandleFunc("GET /api/business-info", jsonHandler(h.getBusinessInfo))
+	apiMux.HandleFunc("PUT /api/business-info", jsonHandler(h.setBusinessInfo))
 
 	// Clients
-	s.mux.HandleFunc("GET /api/clients", jsonHandler(h.listClients))
-	s.mux.HandleFunc("POST /api/clients", jsonHandler(h.addClient))
-	s.mux.HandleFunc("PUT /api/clients/{id}", jsonHandler(h.editClient))
-	s.mux.HandleFunc("DELETE /api/clients/{id}", jsonHandler(h.deleteClient))
+	apiMux.HandleFunc("GET /api/clients", jsonHandler(h.listClients))
+	apiMux.HandleFunc("POST /api/clients", jsonHandler(h.addClient))
+	apiMux.HandleFunc("PUT /api/clients/{id}", jsonHandler(h.editClient))
+	apiMux.HandleFunc("DELETE /api/clients/{id}", jsonHandler(h.deleteClient))
 
 	// Recipients
-	s.mux.HandleFunc("GET /api/clients/{id}/recipients", jsonHandler(h.listRecipients))
-	s.mux.HandleFunc("POST /api/clients/{id}/recipients", jsonHandler(h.addRecipient))
-	s.mux.HandleFunc("DELETE /api/recipients/{id}", jsonHandler(h.removeRecipient))
+	apiMux.HandleFunc("GET /api/clients/{id}/recipients", jsonHandler(h.listRecipients))
+	apiMux.HandleFunc("POST /api/clients/{id}/recipients", jsonHandler(h.addRecipient))
+	apiMux.HandleFunc("DELETE /api/recipients/{id}", jsonHandler(h.removeRecipient))
 
 	// Payment details (legacy per-client — kept for backward-compat;
 	// new UI uses business-level /api/payment-methods below).
-	s.mux.HandleFunc("GET /api/clients/{id}/payment-details", jsonHandler(h.getPaymentDetails))
-	s.mux.HandleFunc("PUT /api/clients/{id}/payment-details", jsonHandler(h.setPaymentDetails))
+	apiMux.HandleFunc("GET /api/clients/{id}/payment-details", jsonHandler(h.getPaymentDetails))
+	apiMux.HandleFunc("PUT /api/clients/{id}/payment-details", jsonHandler(h.setPaymentDetails))
 
 	// Payment methods (business-level — attached to contracts)
-	s.mux.HandleFunc("GET /api/payment-methods", jsonHandler(h.listPaymentMethods))
-	s.mux.HandleFunc("POST /api/payment-methods", jsonHandler(h.addPaymentMethod))
-	s.mux.HandleFunc("PUT /api/payment-methods/{id}", jsonHandler(h.updatePaymentMethod))
-	s.mux.HandleFunc("DELETE /api/payment-methods/{id}", jsonHandler(h.deletePaymentMethod))
+	apiMux.HandleFunc("GET /api/payment-methods", jsonHandler(h.listPaymentMethods))
+	apiMux.HandleFunc("POST /api/payment-methods", jsonHandler(h.addPaymentMethod))
+	apiMux.HandleFunc("PUT /api/payment-methods/{id}", jsonHandler(h.updatePaymentMethod))
+	apiMux.HandleFunc("DELETE /api/payment-methods/{id}", jsonHandler(h.deletePaymentMethod))
 
 	// Contracts
-	s.mux.HandleFunc("GET /api/contracts", jsonHandler(h.listContracts))
-	s.mux.HandleFunc("POST /api/contracts", jsonHandler(h.addContract))
-	s.mux.HandleFunc("PUT /api/contracts/{id}", jsonHandler(h.editContract))
+	apiMux.HandleFunc("GET /api/contracts", jsonHandler(h.listContracts))
+	apiMux.HandleFunc("POST /api/contracts", jsonHandler(h.addContract))
+	apiMux.HandleFunc("PUT /api/contracts/{id}", jsonHandler(h.editContract))
 
 	// Time entries
-	s.mux.HandleFunc("GET /api/time-entries", jsonHandler(h.searchTimeEntries))
-	s.mux.HandleFunc("POST /api/time-entries", jsonHandler(h.addTimeEntry))
-	s.mux.HandleFunc("POST /api/time-entries/bulk", jsonHandler(h.bulkAddTimeEntries))
-	s.mux.HandleFunc("POST /api/time-entries/bulk-delete", jsonHandler(h.bulkDeleteTimeEntries))
-	s.mux.HandleFunc("POST /api/time-entries/mark-invoiced", jsonHandler(h.markTimeEntriesInvoiced))
-	s.mux.HandleFunc("POST /api/time-entries/unmark", jsonHandler(h.unmarkTimeEntries))
-	s.mux.HandleFunc("PUT /api/time-entries/{id}", jsonHandler(h.updateTimeEntry))
-	s.mux.HandleFunc("DELETE /api/time-entries/{id}", jsonHandler(h.deleteTimeEntry))
+	apiMux.HandleFunc("GET /api/time-entries", jsonHandler(h.searchTimeEntries))
+	apiMux.HandleFunc("POST /api/time-entries", jsonHandler(h.addTimeEntry))
+	apiMux.HandleFunc("POST /api/time-entries/bulk", jsonHandler(h.bulkAddTimeEntries))
+	apiMux.HandleFunc("POST /api/time-entries/bulk-delete", jsonHandler(h.bulkDeleteTimeEntries))
+	apiMux.HandleFunc("POST /api/time-entries/mark-invoiced", jsonHandler(h.markTimeEntriesInvoiced))
+	apiMux.HandleFunc("POST /api/time-entries/unmark", jsonHandler(h.unmarkTimeEntries))
+	apiMux.HandleFunc("PUT /api/time-entries/{id}", jsonHandler(h.updateTimeEntry))
+	apiMux.HandleFunc("DELETE /api/time-entries/{id}", jsonHandler(h.deleteTimeEntry))
 
 	// Invoices
-	s.mux.HandleFunc("GET /api/invoices", jsonHandler(h.listInvoices))
-	s.mux.HandleFunc("POST /api/invoices", jsonHandler(h.createInvoice))
-	s.mux.HandleFunc("GET /api/invoices/{number}", jsonHandler(h.getInvoiceDetails))
-	s.mux.HandleFunc("GET /api/invoices/{number}/preview", jsonHandler(h.getInvoicePreview))
-	s.mux.HandleFunc("PATCH /api/invoices/{number}", jsonHandler(h.updateInvoiceStatus))
-	s.mux.HandleFunc("DELETE /api/invoices/{number}", jsonHandler(h.deleteInvoice))
-	s.mux.HandleFunc("POST /api/invoices/{number}/download", jsonHandler(h.downloadInvoice))
+	apiMux.HandleFunc("GET /api/invoices", jsonHandler(h.listInvoices))
+	apiMux.HandleFunc("POST /api/invoices", jsonHandler(h.createInvoice))
+	apiMux.HandleFunc("GET /api/invoices/{number}", jsonHandler(h.getInvoiceDetails))
+	apiMux.HandleFunc("GET /api/invoices/{number}/preview", jsonHandler(h.getInvoicePreview))
+	apiMux.HandleFunc("PATCH /api/invoices/{number}", jsonHandler(h.updateInvoiceStatus))
+	apiMux.HandleFunc("DELETE /api/invoices/{number}", jsonHandler(h.deleteInvoice))
+	apiMux.HandleFunc("POST /api/invoices/{number}/download", jsonHandler(h.downloadInvoice))
+
+	// Expenses
+	apiMux.HandleFunc("GET /api/expenses", jsonHandler(h.listExpenses))
+	apiMux.HandleFunc("POST /api/expenses", jsonHandler(h.addExpense))
+	apiMux.HandleFunc("PUT /api/expenses/{id}", jsonHandler(h.updateExpense))
+	apiMux.HandleFunc("DELETE /api/expenses/{id}", jsonHandler(h.deleteExpense))
 
 	// Quotes
-	s.mux.HandleFunc("GET /api/quotes", jsonHandler(h.listQuotes))
-	s.mux.HandleFunc("POST /api/quotes", jsonHandler(h.createQuote))
-	s.mux.HandleFunc("GET /api/quotes/{number}", jsonHandler(h.getQuoteDetails))
-	s.mux.HandleFunc("PUT /api/quotes/{number}", jsonHandler(h.updateQuote))
-	s.mux.HandleFunc("PATCH /api/quotes/{number}", jsonHandler(h.updateQuoteStatus))
-	s.mux.HandleFunc("DELETE /api/quotes/{number}", jsonHandler(h.deleteQuote))
-	s.mux.HandleFunc("POST /api/quotes/{number}/download", jsonHandler(h.downloadQuote))
-	s.mux.HandleFunc("POST /api/quotes/{number}/convert", jsonHandler(h.convertQuote))
+	apiMux.HandleFunc("GET /api/quotes", jsonHandler(h.listQuotes))
+	apiMux.HandleFunc("POST /api/quotes", jsonHandler(h.createQuote))
+	apiMux.HandleFunc("GET /api/quotes/{number}", jsonHandler(h.getQuoteDetails))
+	apiMux.HandleFunc("PUT /api/quotes/{number}", jsonHandler(h.updateQuote))
+	apiMux.HandleFunc("PATCH /api/quotes/{number}", jsonHandler(h.updateQuoteStatus))
+	apiMux.HandleFunc("DELETE /api/quotes/{number}", jsonHandler(h.deleteQuote))
+	apiMux.HandleFunc("POST /api/quotes/{number}/download", jsonHandler(h.downloadQuote))
+	apiMux.HandleFunc("POST /api/quotes/{number}/convert", jsonHandler(h.convertQuote))
 
-	// Static frontend (SPA fallback)
-	if s.assets != nil {
-		s.mux.HandleFunc("/", s.serveSPA)
+	// Data portability — JSON export of every business-level table, and
+	// a destructive import that wipes the existing rows first. Import is
+	// admin-only when auth is enabled (see below).
+	apiMux.HandleFunc("GET /api/export", h.exportData)
+	apiMux.Handle("POST /api/import", s.adminOnly(http.HandlerFunc(h.importData)))
+
+	// Mount the API mux. When auth is enabled, every /api/* path goes
+	// through the auth middleware. /api/me handles the unauth case itself
+	// (it returns 401), so we exclude it from the redirect path.
+	if s.auth.Enabled() {
+		s.mux.Handle("/api/", s.auth.Middleware(apiMux))
+	} else {
+		s.mux.Handle("/api/", apiMux)
 	}
+
+	// Static frontend (SPA fallback). Auth-gated when enabled, but the
+	// /auth/* routes above stay public because they were registered
+	// directly on s.mux earlier.
+	if s.assets != nil {
+		if s.auth.Enabled() {
+			s.mux.Handle("/", s.auth.Middleware(http.HandlerFunc(s.serveSPA)))
+		} else {
+			s.mux.HandleFunc("/", s.serveSPA)
+		}
+	}
+}
+
+// adminOnly wraps next in the auth.RequireRole("admin") guard when auth is
+// active. With auth disabled the underlying handler runs unchanged — the
+// Wails GUI is single-user by definition so role checks would be theatre.
+func (s *Server) adminOnly(next http.Handler) http.Handler {
+	if !s.auth.Enabled() {
+		return next
+	}
+	return s.auth.RequireRole("admin")(next)
 }
 
 func (s *Server) serveSPA(w http.ResponseWriter, r *http.Request) {

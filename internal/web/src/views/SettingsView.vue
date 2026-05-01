@@ -191,6 +191,71 @@ function toggleTheme() {
   } catch {}
 }
 
+// ---------- Data export/import ----------
+const exporting = ref(false)
+const importing = ref(false)
+const importInput = ref<HTMLInputElement | null>(null)
+
+async function exportData() {
+  exporting.value = true
+  try {
+    const data = await api.exportData()
+    const blob = new Blob([JSON.stringify(data, null, 2)], {
+      type: 'application/json',
+    })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `hours-export-${new Date().toISOString().slice(0, 10)}.json`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+    toast({ tone: 'success', title: 'Export ready', detail: 'Saved to your downloads folder' })
+  } catch (e: any) {
+    toast({ tone: 'error', title: 'Export failed', detail: e.message })
+  } finally {
+    exporting.value = false
+  }
+}
+
+function pickImportFile() {
+  importInput.value?.click()
+}
+
+async function onImportFile(ev: Event) {
+  const target = ev.target as HTMLInputElement
+  const file = target.files?.[0]
+  target.value = ''
+  if (!file) return
+  const ok = await confirm({
+    title: 'Replace all data with this export?',
+    message:
+      'Every client, contract, time entry, invoice, quote and expense will be deleted and replaced by the contents of this file. This cannot be undone.',
+    confirmLabel: 'Replace everything',
+    cancelLabel: 'Cancel',
+    tone: 'danger',
+  })
+  if (!ok) return
+  importing.value = true
+  try {
+    const text = await file.text()
+    const payload = JSON.parse(text)
+    const res = await api.importData(payload)
+    const total = Object.values(res.imported).reduce((a, b) => a + b, 0)
+    toast({
+      tone: 'success',
+      title: 'Import complete',
+      detail: `Loaded ${total} rows across ${Object.keys(res.imported).length} tables`,
+    })
+    setTimeout(() => window.location.reload(), 600)
+  } catch (e: any) {
+    toast({ tone: 'error', title: 'Import failed', detail: e.message })
+  } finally {
+    importing.value = false
+  }
+}
+
 onMounted(async () => {
   await Promise.all([load(), loadMethods()])
 })
@@ -394,6 +459,36 @@ onMounted(async () => {
           </tbody>
         </table>
       </section>
+
+      <section class="methods-section">
+        <div class="methods-head">
+          <div>
+            <div class="mono-label text-disabled">PORTABILITY</div>
+            <h2 class="methods-title">Export &amp; Import</h2>
+            <div class="methods-sub">
+              Move your hours, clients, contracts, invoices, quotes and expenses
+              between machines or apps. Export downloads a single JSON file. Import
+              <strong>replaces every row</strong> in this database with the file's
+              contents — back up first if you're not sure.
+            </div>
+          </div>
+        </div>
+        <div class="io-actions">
+          <button class="btn btn-primary" :disabled="exporting" @click="exportData">
+            {{ exporting ? 'EXPORTING...' : 'EXPORT ALL DATA' }}
+          </button>
+          <button class="btn btn-ghost" :disabled="importing" @click="pickImportFile">
+            {{ importing ? 'IMPORTING...' : 'IMPORT FROM FILE' }}
+          </button>
+          <input
+            ref="importInput"
+            type="file"
+            accept="application/json,.json"
+            style="display: none"
+            @change="onImportFile"
+          />
+        </div>
+      </section>
     </template>
 
     <Modal
@@ -583,5 +678,11 @@ onMounted(async () => {
 
 .checkbox-label input {
   margin: 0;
+}
+
+.io-actions {
+  display: flex;
+  gap: var(--space-md);
+  flex-wrap: wrap;
 }
 </style>

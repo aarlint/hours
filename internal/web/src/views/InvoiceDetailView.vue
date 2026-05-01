@@ -236,10 +236,49 @@ const daysUntilDue = computed(() => {
         </tbody>
         <tfoot>
           <tr>
-            <td colspan="3" class="mono-label text-disabled" style="text-align: right">TOTAL</td>
+            <td colspan="3" class="mono-label text-disabled" style="text-align: right">HOURS SUBTOTAL</td>
             <td class="num">{{ formatHours(data.total_hours) }}</td>
             <td></td>
-            <td class="num" style="font-weight: 500">{{ formatCurrency(data.invoice.total_amount) }}</td>
+            <td class="num" style="font-weight: 500">
+              {{ formatCurrency(data.invoice.total_amount - (data.total_expenses || 0)) }}
+            </td>
+          </tr>
+        </tfoot>
+      </table>
+    </section>
+
+    <section v-if="data.expenses && data.expenses.length">
+      <div class="section-head">
+        <span class="mono-label">EXPENSES · {{ data.expenses.length }} ITEMS</span>
+      </div>
+
+      <table class="table">
+        <thead>
+          <tr>
+            <th class="num">DATE</th>
+            <th>CATEGORY</th>
+            <th>DESCRIPTION</th>
+            <th class="num">AMOUNT</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="e in data.expenses" :key="e.id">
+            <td class="num mono text-disabled">{{ e.date }}</td>
+            <td class="mono text-secondary">{{ e.category || '—' }}</td>
+            <td>{{ e.description }}</td>
+            <td class="num">{{ formatCurrency(e.amount, e.currency) }}</td>
+          </tr>
+        </tbody>
+        <tfoot>
+          <tr>
+            <td colspan="3" class="mono-label text-disabled" style="text-align: right">EXPENSES SUBTOTAL</td>
+            <td class="num" style="font-weight: 500">{{ formatCurrency(data.total_expenses) }}</td>
+          </tr>
+          <tr>
+            <td colspan="3" class="mono-label" style="text-align: right; padding-top: var(--space-md)">GRAND TOTAL</td>
+            <td class="num" style="font-weight: 600; font-size: 16px; padding-top: var(--space-md)">
+              {{ formatCurrency(data.invoice.total_amount) }}
+            </td>
           </tr>
         </tfoot>
       </table>

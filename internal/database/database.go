@@ -319,6 +319,12 @@ func runMigrations(db *sql.DB) error {
 				return addBillingCyclesToContracts(db)
 			},
 		},
+		{
+			name: "add_users_table",
+			apply: func(db *sql.DB) error {
+				return addUsersTable(db)
+			},
+		},
 	}
 
 	for _, migration := range migrations {
@@ -643,6 +649,40 @@ func migratePaymentDetailsToMethods(db *sql.DB) error {
 	}
 
 	return tx.Commit()
+}
+
+// addUsersTable creates the users + sessions tables used by the OIDC auth
+// layer. The serve mode requires auth when OIDC env vars are set; users are
+// auto-provisioned on first sign-in. Wails GUI bypasses both tables — they
+// only matter on the network-exposed HTTP path.
+func addUsersTable(db *sql.DB) error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS users (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			oidc_subject TEXT NOT NULL UNIQUE,
+			email TEXT NOT NULL,
+			name TEXT,
+			role TEXT NOT NULL DEFAULT 'user',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			last_login_at DATETIME
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)`,
+		`CREATE TABLE IF NOT EXISTS sessions (
+			token TEXT PRIMARY KEY,
+			user_id INTEGER NOT NULL,
+			expires_at DATETIME NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)`,
+	}
+	for _, s := range stmts {
+		if _, err := db.Exec(s); err != nil {
+			return fmt.Errorf("create users/sessions: %w", err)
+		}
+	}
+	return nil
 }
 
 func addBillingCyclesToContracts(db *sql.DB) error {

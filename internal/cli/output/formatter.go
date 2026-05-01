@@ -50,7 +50,7 @@ func (f *Formatter) Success(message string) {
 
 // Error prints an error message
 func (f *Formatter) Error(message string) {
-	fmt.Fprintf(os.Stderr, f.colorize(Red, "✗ "+message)+"\n")
+	fmt.Fprintln(os.Stderr, f.colorize(Red, "✗ "+message))
 }
 
 // Warning prints a warning message

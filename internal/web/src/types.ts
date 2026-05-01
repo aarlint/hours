@@ -111,7 +111,38 @@ export interface Invoice {
 export interface InvoiceDetails {
   invoice: Invoice
   time_entries: TimeEntry[]
+  expenses: Expense[]
   total_hours: number
+  total_expenses: number
+}
+
+export interface Expense {
+  id: string
+  client_id: number
+  client_name: string
+  contract_id?: number | null
+  contract_number?: string
+  date: string
+  description: string
+  amount: number
+  currency: string
+  category?: string
+  receipt_path?: string
+  invoice_id?: number | null
+  invoice_number?: string
+  created_at: string
+}
+
+export interface ExpenseInput {
+  client_id: number
+  contract_id?: number | null
+  contract_number?: string
+  date: string
+  description: string
+  amount: number
+  currency?: string
+  category?: string
+  receipt_path?: string
 }
 
 export interface InvoicePreview {
@@ -177,6 +208,17 @@ export interface BusinessInfo {
   invoice_prefix?: string
   export_path?: string
   updated_at: string
+}
+
+// AuthState mirrors GET /api/me. When auth is disabled by the server the
+// payload is `{ auth_enabled: false }`; otherwise it's a fully populated
+// user record (or 401 when no session is present).
+export interface AuthState {
+  auth_enabled?: boolean
+  id?: number
+  email?: string
+  name?: string
+  role?: 'admin' | 'user' | string
 }
 
 export interface Stats {
