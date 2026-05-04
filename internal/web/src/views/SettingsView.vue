@@ -8,7 +8,7 @@ import Modal from '../components/Modal.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { useConfirm } from '../composables/useConfirm'
 import { useToasts } from '../composables/useToasts'
-import { isWails, pickDirectory, revealInFinder } from '../wailsShim'
+import { isWails, pickDirectory, revealInFinder, saveTextFile } from '../wailsShim'
 
 const loading = ref(true)
 const saving = ref(false)
@@ -200,13 +200,32 @@ async function exportData() {
   exporting.value = true
   try {
     const data = await api.exportData()
-    const blob = new Blob([JSON.stringify(data, null, 2)], {
-      type: 'application/json',
-    })
+    const json = JSON.stringify(data, null, 2)
+    const filename = `hours-export-${new Date().toISOString().slice(0, 10)}.json`
+
+    // In the Wails webview the browser <a download> trick silently no-ops,
+    // so we route through a native save dialog binding when available.
+    if (isWails()) {
+      const path = await saveTextFile(filename, json)
+      if (!path) {
+        // user cancelled the dialog
+        return
+      }
+      toast({
+        tone: 'success',
+        title: 'Export saved',
+        detail: path,
+      })
+      // Best-effort reveal so they can see the file.
+      void revealInFinder(path)
+      return
+    }
+
+    const blob = new Blob([json], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `hours-export-${new Date().toISOString().slice(0, 10)}.json`
+    a.download = filename
     document.body.appendChild(a)
     a.click()
     document.body.removeChild(a)

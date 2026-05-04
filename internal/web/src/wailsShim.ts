@@ -19,6 +19,7 @@ interface GoApp {
   Request(method: string, path: string, body: string): Promise<WailsResponse>
   PickDirectory?(title: string): Promise<string>
   RevealInFinder?(path: string): Promise<void>
+  SaveTextFile?(suggestedName: string, content: string): Promise<string>
 }
 
 interface WailsRuntime {
@@ -77,4 +78,16 @@ export async function revealInFinder(path: string): Promise<boolean> {
   if (!app?.RevealInFinder || !path) return false
   await app.RevealInFinder(path)
   return true
+}
+
+// saveTextFile prompts the user with the native save dialog and writes the
+// file to disk. Returns the absolute path, or null if cancelled / not Wails.
+export async function saveTextFile(
+  suggestedName: string,
+  content: string,
+): Promise<string | null> {
+  const app = findApp()
+  if (!app?.SaveTextFile) return null
+  const path = await app.SaveTextFile(suggestedName, content)
+  return path || null
 }

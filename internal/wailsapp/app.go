@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -97,6 +98,36 @@ func (a *App) PickDirectory(title string) (string, error) {
 	return wailsruntime.OpenDirectoryDialog(a.ctx, wailsruntime.OpenDialogOptions{
 		Title: title,
 	})
+}
+
+// SaveTextFile prompts the user with the native save dialog and writes the
+// supplied content to the chosen path. Returns the absolute path on success
+// or "" when the user cancels.
+//
+// This is the proper way to "download" data in the Wails webview — the
+// browser's <a download> shim doesn't trigger a real save in the embedded
+// webkit, so without this binding the file silently evaporates.
+func (a *App) SaveTextFile(suggestedName, content string) (string, error) {
+	if suggestedName == "" {
+		suggestedName = "export.txt"
+	}
+	defaultDir := ""
+	if home, err := os.UserHomeDir(); err == nil {
+		defaultDir = filepath.Join(home, "Downloads")
+	}
+	path, err := wailsruntime.SaveFileDialog(a.ctx, wailsruntime.SaveDialogOptions{
+		Title:                "Save export",
+		DefaultFilename:      suggestedName,
+		DefaultDirectory:     defaultDir,
+		CanCreateDirectories: true,
+	})
+	if err != nil || path == "" {
+		return "", err
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // RevealInFinder opens the enclosing folder of the given path and selects
