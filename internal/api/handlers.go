@@ -1127,14 +1127,16 @@ func (h *handlers) getInvoiceDetails(w http.ResponseWriter, r *http.Request) (in
 // invoicePreviewResponse is the render-ready payload for the HTML preview.
 // Everything the UI needs to draw the invoice without extra round-trips.
 type invoicePreviewResponse struct {
-	Invoice     invoiceDTO            `json:"invoice"`
-	Client      models.Client         `json:"client"`
-	Contracts   []models.Contract     `json:"contracts"`
-	TimeEntries []timeEntryDTO        `json:"time_entries"`
-	TotalHours  float64               `json:"total_hours"`
-	Payment     models.PaymentDetails `json:"payment"`
-	Recipients  []models.Recipient    `json:"recipients"`
-	Business    models.BusinessInfo   `json:"business"`
+	Invoice       invoiceDTO            `json:"invoice"`
+	Client        models.Client         `json:"client"`
+	Contracts     []models.Contract     `json:"contracts"`
+	TimeEntries   []timeEntryDTO        `json:"time_entries"`
+	Expenses      []expenseRow          `json:"expenses"`
+	TotalHours    float64               `json:"total_hours"`
+	TotalExpenses float64               `json:"total_expenses"`
+	Payment       models.PaymentDetails `json:"payment"`
+	Recipients    []models.Recipient    `json:"recipients"`
+	Business      models.BusinessInfo   `json:"business"`
 }
 
 func (h *handlers) getInvoicePreview(w http.ResponseWriter, r *http.Request) (interface{}, error) {
@@ -1252,15 +1254,49 @@ func (h *handlers) getInvoicePreview(w http.ResponseWriter, r *http.Request) (in
 		&business.ZipCode, &business.Country, &business.TaxID, &business.Website,
 		&business.LogoPath, &business.InvoicePrefix, &business.ExportPath, &business.UpdatedAt)
 
+	previewExpRows, err := h.db.Query(`
+		SELECT e.id, e.client_id, c.name, e.contract_id, COALESCE(ct.contract_number,''),
+		       e.date, e.description, e.amount, e.currency,
+		       COALESCE(e.category,''), COALESCE(e.receipt_path,''),
+		       e.invoice_id, COALESCE(i.invoice_number,''), e.created_at
+		FROM expenses e
+		JOIN clients c ON c.id = e.client_id
+		LEFT JOIN contracts ct ON ct.id = e.contract_id
+		LEFT JOIN invoices i ON i.id = e.invoice_id
+		WHERE e.invoice_id = ?
+		ORDER BY e.date
+	`, inv.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer previewExpRows.Close()
+	previewExpenses := []expenseRow{}
+	totalPreviewExpenses := 0.0
+	for previewExpRows.Next() {
+		var ex expenseRow
+		var date, created time.Time
+		if err := previewExpRows.Scan(&ex.ID, &ex.ClientID, &ex.ClientName, &ex.ContractID, &ex.ContractNumber,
+			&date, &ex.Description, &ex.Amount, &ex.Currency, &ex.Category, &ex.ReceiptPath,
+			&ex.InvoiceID, &ex.InvoiceNumber, &created); err != nil {
+			return nil, err
+		}
+		ex.Date = date.Format("2006-01-02")
+		ex.CreatedAt = created.Format(time.RFC3339)
+		previewExpenses = append(previewExpenses, ex)
+		totalPreviewExpenses += ex.Amount
+	}
+
 	return invoicePreviewResponse{
-		Invoice:     inv,
-		Client:      client,
-		Contracts:   contracts,
-		TimeEntries: entries,
-		TotalHours:  totalHours,
-		Payment:     payment,
-		Recipients:  recipients,
-		Business:    business,
+		Invoice:       inv,
+		Client:        client,
+		Contracts:     contracts,
+		TimeEntries:   entries,
+		Expenses:      previewExpenses,
+		TotalHours:    totalHours,
+		TotalExpenses: totalPreviewExpenses,
+		Payment:       payment,
+		Recipients:    recipients,
+		Business:      business,
 	}, nil
 }
 
@@ -1365,8 +1401,35 @@ func (h *handlers) createInvoice(w http.ResponseWriter, r *http.Request) (interf
 		totalHours += e.Hours
 		totalAmount += e.Hours * rate
 	}
-	if len(entries) == 0 {
-		return nil, newAPIError(http.StatusPreconditionFailed, "no unbilled hours in period")
+
+	// Sweep up unbilled expenses in the same period — mirrors the MCP
+	// path so the web invoice flow doesn't silently drop pass-through costs.
+	expRows, err := h.db.Query(`
+		SELECT id, client_id, contract_id, date, description, amount, currency,
+		       COALESCE(category,''), COALESCE(receipt_path,'')
+		FROM expenses
+		WHERE client_id = ? AND date >= ? AND date <= ? AND invoice_id IS NULL
+		ORDER BY date
+	`, req.ClientID, startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
+	if err != nil {
+		return nil, err
+	}
+	defer expRows.Close()
+	var expenses []models.Expense
+	var totalExpenses float64
+	for expRows.Next() {
+		var ex models.Expense
+		if err := expRows.Scan(&ex.ID, &ex.ClientID, &ex.ContractID, &ex.Date, &ex.Description,
+			&ex.Amount, &ex.Currency, &ex.Category, &ex.ReceiptPath); err != nil {
+			return nil, err
+		}
+		expenses = append(expenses, ex)
+		totalExpenses += ex.Amount
+	}
+	totalAmount += totalExpenses
+
+	if len(entries) == 0 && len(expenses) == 0 {
+		return nil, newAPIError(http.StatusPreconditionFailed, "no unbilled hours or expenses in period")
 	}
 
 	invoiceNumber := fmt.Sprintf("INV-%s-%s", time.Now().Format("200601"), uuid.New().String()[:8])
@@ -1395,6 +1458,11 @@ func (h *handlers) createInvoice(w http.ResponseWriter, r *http.Request) (interf
 
 	for _, e := range entries {
 		if _, err := tx.Exec(`UPDATE time_entries SET invoice_id = ? WHERE id = ?`, invoiceID, e.ID); err != nil {
+			return nil, err
+		}
+	}
+	for _, ex := range expenses {
+		if _, err := tx.Exec(`UPDATE expenses SET invoice_id = ? WHERE id = ?`, invoiceID, ex.ID); err != nil {
 			return nil, err
 		}
 	}
@@ -1445,6 +1513,7 @@ func (h *handlers) createInvoice(w http.ResponseWriter, r *http.Request) (interf
 		Status:        "pending",
 		Client:        &client,
 		TimeEntries:   entries,
+		Expenses:      expenses,
 	}
 
 	generator := pdf.NewInvoiceGenerator()
@@ -1464,6 +1533,8 @@ func (h *handlers) createInvoice(w http.ResponseWriter, r *http.Request) (interf
 		"invoice_number": invoiceNumber,
 		"total_amount":   totalAmount,
 		"total_hours":    totalHours,
+		"total_expenses": totalExpenses,
+		"expense_count":  len(expenses),
 		"pdf_path":       pdfPath,
 	}, nil
 }
