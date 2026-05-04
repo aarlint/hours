@@ -150,7 +150,9 @@ export interface InvoicePreview {
   client: Client
   contracts: Contract[]
   time_entries: TimeEntry[]
+  expenses: Expense[]
   total_hours: number
+  total_expenses: number
   payment: PaymentDetails
   recipients: Recipient[]
   business: BusinessInfo
