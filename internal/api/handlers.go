@@ -6,14 +6,28 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/austin/hours-mcp/internal/auth"
 	"github.com/austin/hours-mcp/internal/models"
 	"github.com/austin/hours-mcp/internal/pdf"
 	"github.com/austin/hours-mcp/internal/timeparse"
 	"github.com/google/uuid"
 )
+
+// currentUserID returns the authenticated user's id from the request context.
+// Defense in depth: the auth middleware should already have rejected the
+// request if there's no session, but every handler also calls this so that
+// running unauthenticated (e.g. wrong wiring) cannot leak data.
+func currentUserID(r *http.Request) (int64, error) {
+	u, ok := auth.UserFromContext(r.Context())
+	if !ok || u == nil {
+		return 0, newAPIError(http.StatusUnauthorized, "authentication required")
+	}
+	return u.ID, nil
+}
 
 type handlers struct {
 	db *sql.DB
@@ -78,49 +92,68 @@ type statsDTO struct {
 
 // ---------- Helpers ----------
 
-func (h *handlers) clientIDByName(name string) (int, error) {
+func (h *handlers) clientIDByName(userID int64, name string) (int, error) {
 	var id int
-	err := h.db.QueryRow("SELECT id FROM clients WHERE name = ?", name).Scan(&id)
+	err := h.db.QueryRow("SELECT id FROM clients WHERE user_id = ? AND name = ?", userID, name).Scan(&id)
 	if err == sql.ErrNoRows {
 		return 0, newAPIError(http.StatusNotFound, "client '%s' not found", name)
 	}
 	return id, err
 }
 
+// requireClient confirms the client id belongs to the given user. Used by
+// handlers that take :id path params for nested resources (recipients,
+// payment-details) so we don't leak data via foreign-key reach-around.
+func (h *handlers) requireClient(userID int64, clientID int) (string, error) {
+	var name string
+	err := h.db.QueryRow("SELECT name FROM clients WHERE id = ? AND user_id = ?", clientID, userID).Scan(&name)
+	if err == sql.ErrNoRows {
+		return "", newAPIError(http.StatusNotFound, "client not found")
+	}
+	if err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
 // ---------- Stats ----------
 
 func (h *handlers) getStats(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	s := statsDTO{}
 
-	_ = h.db.QueryRow(`SELECT COUNT(*) FROM clients`).Scan(&s.TotalClients)
-	_ = h.db.QueryRow(`SELECT COUNT(*) FROM contracts WHERE status = 'active'`).Scan(&s.ActiveContracts)
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM clients WHERE user_id = ?`, userID).Scan(&s.TotalClients)
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM contracts WHERE user_id = ? AND status = 'active'`, userID).Scan(&s.ActiveContracts)
 
 	_ = h.db.QueryRow(`
 		SELECT COALESCE(SUM(te.hours), 0), COALESCE(SUM(te.hours * ct.hourly_rate), 0)
 		FROM time_entries te
 		JOIN contracts ct ON te.contract_id = ct.id
-		WHERE te.invoice_id IS NULL
-	`).Scan(&s.UnbilledHours, &s.UnbilledAmount)
+		WHERE te.invoice_id IS NULL AND te.user_id = ?
+	`, userID).Scan(&s.UnbilledHours, &s.UnbilledAmount)
 
 	now := time.Now()
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
 	lastMonthStart := monthStart.AddDate(0, -1, 0)
 
 	_ = h.db.QueryRow(`
-		SELECT COALESCE(SUM(hours), 0) FROM time_entries WHERE date >= ?
-	`, monthStart.Format("2006-01-02")).Scan(&s.HoursThisMonth)
+		SELECT COALESCE(SUM(hours), 0) FROM time_entries WHERE user_id = ? AND date >= ?
+	`, userID, monthStart.Format("2006-01-02")).Scan(&s.HoursThisMonth)
 
 	_ = h.db.QueryRow(`
-		SELECT COALESCE(SUM(hours), 0) FROM time_entries WHERE date >= ? AND date < ?
-	`, lastMonthStart.Format("2006-01-02"), monthStart.Format("2006-01-02")).Scan(&s.HoursLastMonth)
+		SELECT COALESCE(SUM(hours), 0) FROM time_entries WHERE user_id = ? AND date >= ? AND date < ?
+	`, userID, lastMonthStart.Format("2006-01-02"), monthStart.Format("2006-01-02")).Scan(&s.HoursLastMonth)
 
 	_ = h.db.QueryRow(`
-		SELECT COALESCE(SUM(total_amount), 0), COUNT(*) FROM invoices WHERE status IN ('pending','sent','overdue')
-	`).Scan(&s.OutstandingAmount, &s.InvoicesPending)
+		SELECT COALESCE(SUM(total_amount), 0), COUNT(*) FROM invoices WHERE user_id = ? AND status IN ('pending','sent','overdue')
+	`, userID).Scan(&s.OutstandingAmount, &s.InvoicesPending)
 
 	_ = h.db.QueryRow(`
-		SELECT COALESCE(SUM(total_amount), 0), COUNT(*) FROM invoices WHERE status = 'paid'
-	`).Scan(&s.PaidAmount, &s.InvoicesPaid)
+		SELECT COALESCE(SUM(total_amount), 0), COUNT(*) FROM invoices WHERE user_id = ? AND status = 'paid'
+	`, userID).Scan(&s.PaidAmount, &s.InvoicesPaid)
 
 	entries, err := h.queryTimeEntries(`
 		SELECT te.id, te.contract_id, te.date, te.hours, te.description, te.invoice_id, te.created_at,
@@ -129,9 +162,10 @@ func (h *handlers) getStats(w http.ResponseWriter, r *http.Request) (interface{}
 		JOIN contracts ct ON te.contract_id = ct.id
 		JOIN clients cl ON ct.client_id = cl.id
 		LEFT JOIN invoices i ON te.invoice_id = i.id
+		WHERE te.user_id = ?
 		ORDER BY te.date DESC, te.created_at DESC
 		LIMIT 10
-	`)
+	`, userID)
 	if err == nil {
 		s.RecentEntries = entries
 	} else {
@@ -144,13 +178,18 @@ func (h *handlers) getStats(w http.ResponseWriter, r *http.Request) (interface{}
 // ---------- Clients ----------
 
 func (h *handlers) listClients(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := h.db.Query(`
 		SELECT c.id, c.name, COALESCE(c.address,''), COALESCE(c.city,''), COALESCE(c.state,''),
 		       COALESCE(c.zip_code,''), COALESCE(c.country,''), c.created_at, c.updated_at,
 		       COALESCE((SELECT COUNT(*) FROM contracts WHERE client_id = c.id AND status = 'active'), 0)
 		FROM clients c
+		WHERE c.user_id = ?
 		ORDER BY c.name
-	`)
+	`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -178,6 +217,10 @@ type addClientReq struct {
 }
 
 func (h *handlers) addClient(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	var req addClientReq
 	if err := decodeBody(r, &req); err != nil {
 		return nil, err
@@ -186,9 +229,9 @@ func (h *handlers) addClient(w http.ResponseWriter, r *http.Request) (interface{
 		return nil, newAPIError(http.StatusBadRequest, "name is required")
 	}
 	res, err := h.db.Exec(`
-		INSERT INTO clients (name, address, city, state, zip_code, country)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, req.Name, req.Address, req.City, req.State, req.ZipCode, req.Country)
+		INSERT INTO clients (user_id, name, address, city, state, zip_code, country)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, userID, req.Name, req.Address, req.City, req.State, req.ZipCode, req.Country)
 	if err != nil {
 		return nil, err
 	}
@@ -206,6 +249,10 @@ type editClientReq struct {
 }
 
 func (h *handlers) editClient(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	id, err := pathInt(r, "id")
 	if err != nil {
 		return nil, err
@@ -244,22 +291,31 @@ func (h *handlers) editClient(w http.ResponseWriter, r *http.Request) (interface
 		return nil, newAPIError(http.StatusBadRequest, "no fields provided")
 	}
 	sets = append(sets, "updated_at = CURRENT_TIMESTAMP")
-	args = append(args, id)
-	q := fmt.Sprintf("UPDATE clients SET %s WHERE id = ?", strings.Join(sets, ", "))
-	if _, err := h.db.Exec(q, args...); err != nil {
+	args = append(args, id, userID)
+	q := fmt.Sprintf("UPDATE clients SET %s WHERE id = ? AND user_id = ?", strings.Join(sets, ", "))
+	res, err := h.db.Exec(q, args...)
+	if err != nil {
 		return nil, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return nil, newAPIError(http.StatusNotFound, "client not found")
 	}
 	return map[string]interface{}{"id": id}, nil
 }
 
 func (h *handlers) deleteClient(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	id, err := pathInt(r, "id")
 	if err != nil {
 		return nil, err
 	}
 
 	var name string
-	err = h.db.QueryRow("SELECT name FROM clients WHERE id = ?", id).Scan(&name)
+	err = h.db.QueryRow("SELECT name FROM clients WHERE id = ? AND user_id = ?", id, userID).Scan(&name)
 	if err == sql.ErrNoRows {
 		return nil, newAPIError(http.StatusNotFound, "client not found")
 	}
@@ -277,11 +333,11 @@ func (h *handlers) deleteClient(w http.ResponseWriter, r *http.Request) (interfa
 
 	// ON DELETE CASCADE wipes recipients, payment_details, contracts,
 	// time_entries, invoices, and quotes in one shot.
-	if _, err := h.db.Exec("DELETE FROM clients WHERE id = ?", id); err != nil {
+	if _, err := h.db.Exec("DELETE FROM clients WHERE id = ? AND user_id = ?", id, userID); err != nil {
 		return nil, err
 	}
 
-	BroadcastEvent("client.deleted", map[string]any{
+	BroadcastUserEvent(userID, "client.deleted", map[string]any{
 		"id":           id,
 		"name":         name,
 		"contracts":    contracts,
@@ -315,8 +371,16 @@ type recipientDTO struct {
 }
 
 func (h *handlers) listRecipients(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	id, err := pathInt(r, "id")
 	if err != nil {
+		return nil, err
+	}
+	// Verify the client belongs to this user before exposing recipients.
+	if _, err := h.requireClient(userID, id); err != nil {
 		return nil, err
 	}
 	rows, err := h.db.Query(`
@@ -349,8 +413,15 @@ type addRecipientReq struct {
 }
 
 func (h *handlers) addRecipient(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	clientID, err := pathInt(r, "id")
 	if err != nil {
+		return nil, err
+	}
+	if _, err := h.requireClient(userID, clientID); err != nil {
 		return nil, err
 	}
 	var req addRecipientReq
@@ -377,11 +448,19 @@ func (h *handlers) addRecipient(w http.ResponseWriter, r *http.Request) (interfa
 }
 
 func (h *handlers) removeRecipient(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	id, err := pathInt(r, "id")
 	if err != nil {
 		return nil, err
 	}
-	res, err := h.db.Exec(`DELETE FROM recipients WHERE id = ?`, id)
+	// Scope through the client's user_id to prevent cross-tenant deletes.
+	res, err := h.db.Exec(`
+		DELETE FROM recipients
+		WHERE id = ? AND client_id IN (SELECT id FROM clients WHERE user_id = ?)
+	`, id, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -395,16 +474,28 @@ func (h *handlers) removeRecipient(w http.ResponseWriter, r *http.Request) (inte
 // ---------- Payment details ----------
 
 func (h *handlers) getPaymentDetails(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	id, err := pathInt(r, "id")
 	if err != nil {
 		return nil, err
 	}
+	if _, err := h.requireClient(userID, id); err != nil {
+		return nil, err
+	}
+	// Defense-in-depth: requireClient above already verified ownership of the
+	// client_id, but the payment_details query also re-checks user scope so
+	// any future caller that skips requireClient still cannot leak rows.
 	var pd models.PaymentDetails
 	err = h.db.QueryRow(`
 		SELECT id, client_id, COALESCE(bank_name,''), COALESCE(account_number,''), COALESCE(routing_number,''),
 		       COALESCE(swift_code,''), COALESCE(payment_terms,''), COALESCE(notes,''), updated_at
-		FROM payment_details WHERE client_id = ?
-	`, id).Scan(&pd.ID, &pd.ClientID, &pd.BankName, &pd.AccountNumber, &pd.RoutingNumber,
+		FROM payment_details
+		WHERE client_id = ?
+		  AND client_id IN (SELECT id FROM clients WHERE user_id = ?)
+	`, id, userID).Scan(&pd.ID, &pd.ClientID, &pd.BankName, &pd.AccountNumber, &pd.RoutingNumber,
 		&pd.SwiftCode, &pd.PaymentTerms, &pd.Notes, &pd.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -425,8 +516,15 @@ type paymentDetailsReq struct {
 }
 
 func (h *handlers) setPaymentDetails(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	id, err := pathInt(r, "id")
 	if err != nil {
+		return nil, err
+	}
+	if _, err := h.requireClient(userID, id); err != nil {
 		return nil, err
 	}
 	var req paymentDetailsReq
@@ -454,6 +552,10 @@ func (h *handlers) setPaymentDetails(w http.ResponseWriter, r *http.Request) (in
 // ---------- Contracts ----------
 
 func (h *handlers) listContracts(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	q := `
 		SELECT c.id, c.client_id, c.contract_number, c.name, c.hourly_rate, c.currency, c.contract_type,
 		       c.start_date, c.end_date, c.status, COALESCE(c.payment_terms,''), c.payment_method_id,
@@ -461,9 +563,9 @@ func (h *handlers) listContracts(w http.ResponseWriter, r *http.Request) (interf
 		       c.created_at, c.updated_at, cl.name
 		FROM contracts c
 		JOIN clients cl ON c.client_id = cl.id
-		WHERE 1=1
+		WHERE c.user_id = ?
 	`
-	args := []interface{}{}
+	args := []interface{}{userID}
 	if v := r.URL.Query().Get("client_id"); v != "" {
 		q += " AND c.client_id = ?"
 		args = append(args, v)
@@ -517,12 +619,19 @@ type addContractReq struct {
 }
 
 func (h *handlers) addContract(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	var req addContractReq
 	if err := decodeBody(r, &req); err != nil {
 		return nil, err
 	}
 	if req.ClientID == 0 || req.ContractNumber == "" || req.Name == "" || req.StartDate == "" {
 		return nil, newAPIError(http.StatusBadRequest, "client_id, contract_number, name, start_date required")
+	}
+	if _, err := h.requireClient(userID, req.ClientID); err != nil {
+		return nil, err
 	}
 	if req.Currency == "" {
 		req.Currency = "USD"
@@ -552,11 +661,11 @@ func (h *handlers) addContract(w http.ResponseWriter, r *http.Request) (interfac
 
 	var id int64
 	err = h.db.QueryRow(`
-		INSERT INTO contracts (client_id, contract_number, name, hourly_rate, currency, contract_type,
+		INSERT INTO contracts (user_id, client_id, contract_number, name, hourly_rate, currency, contract_type,
 		                      start_date, end_date, status, payment_terms, payment_method_id, notes)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		RETURNING id
-	`, req.ClientID, req.ContractNumber, req.Name, req.HourlyRate, req.Currency, req.ContractType,
+	`, userID, req.ClientID, req.ContractNumber, req.Name, req.HourlyRate, req.Currency, req.ContractType,
 		start.Format("2006-01-02"), endPtr, req.Status, req.PaymentTerms, methodPtr, req.Notes).Scan(&id)
 	if err != nil {
 		return nil, err
@@ -578,6 +687,10 @@ type editContractReq struct {
 }
 
 func (h *handlers) editContract(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	id, err := pathInt(r, "id")
 	if err != nil {
 		return nil, err
@@ -637,8 +750,8 @@ func (h *handlers) editContract(w http.ResponseWriter, r *http.Request) (interfa
 		return nil, newAPIError(http.StatusBadRequest, "no fields provided")
 	}
 	sets = append(sets, "updated_at = CURRENT_TIMESTAMP")
-	args = append(args, id)
-	q := fmt.Sprintf("UPDATE contracts SET %s WHERE id = ?", strings.Join(sets, ", "))
+	args = append(args, id, userID)
+	q := fmt.Sprintf("UPDATE contracts SET %s WHERE id = ? AND user_id = ?", strings.Join(sets, ", "))
 	res, err := h.db.Exec(q, args...)
 	if err != nil {
 		return nil, err
@@ -647,7 +760,7 @@ func (h *handlers) editContract(w http.ResponseWriter, r *http.Request) (interfa
 	if n == 0 {
 		return nil, newAPIError(http.StatusNotFound, "contract not found")
 	}
-	BroadcastEvent("contract.updated", map[string]any{"id": id})
+	BroadcastUserEvent(userID, "contract.updated", map[string]any{"id": id})
 	return map[string]interface{}{"id": id}, nil
 }
 
@@ -678,6 +791,10 @@ func (h *handlers) queryTimeEntries(q string, args ...interface{}) ([]timeEntryD
 }
 
 func (h *handlers) searchTimeEntries(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	q := `
 		SELECT te.id, te.contract_id, te.date, te.hours, te.description, te.invoice_id, te.created_at,
 		       cl.id, cl.name, ct.contract_number, ct.name, ct.hourly_rate, ct.currency, i.invoice_number
@@ -685,9 +802,9 @@ func (h *handlers) searchTimeEntries(w http.ResponseWriter, r *http.Request) (in
 		JOIN contracts ct ON te.contract_id = ct.id
 		JOIN clients cl ON ct.client_id = cl.id
 		LEFT JOIN invoices i ON te.invoice_id = i.id
-		WHERE 1=1
+		WHERE te.user_id = ?
 	`
-	args := []interface{}{}
+	args := []interface{}{userID}
 
 	qv := r.URL.Query()
 	if v := qv.Get("client_id"); v != "" {
@@ -726,7 +843,17 @@ func (h *handlers) searchTimeEntries(w http.ResponseWriter, r *http.Request) (in
 	}
 	q += " ORDER BY te.date DESC, te.created_at DESC"
 	if v := qv.Get("limit"); v != "" {
-		q += " LIMIT " + v
+		// Parse and clamp the limit instead of inlining the raw query value
+		// — it lands in the SQL string by value (no `?` placeholder) so any
+		// non-integer would be a SQL injection foothold.
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return nil, newAPIError(http.StatusBadRequest, "invalid limit")
+		}
+		if n > 5000 {
+			n = 5000
+		}
+		q += fmt.Sprintf(" LIMIT %d", n)
 	}
 	return h.queryTimeEntries(q, args...)
 }
@@ -740,11 +867,15 @@ type addTimeEntryReq struct {
 }
 
 func (h *handlers) addTimeEntry(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	var req addTimeEntryReq
 	if err := decodeBody(r, &req); err != nil {
 		return nil, err
 	}
-	contractID, clientID, err := h.resolveContract(req.ContractID, req.ContractNumber)
+	contractID, clientID, err := h.resolveContract(userID, req.ContractID, req.ContractNumber)
 	if err != nil {
 		return nil, err
 	}
@@ -757,19 +888,19 @@ func (h *handlers) addTimeEntry(w http.ResponseWriter, r *http.Request) (interfa
 	}
 	id := uuid.New().String()
 	_, err = h.db.Exec(`
-		INSERT INTO time_entries (id, client_id, contract_id, date, hours, description)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, id, clientID, contractID, date.Format("2006-01-02"), req.Hours, req.Description)
+		INSERT INTO time_entries (id, user_id, client_id, contract_id, date, hours, description)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, id, userID, clientID, contractID, date.Format("2006-01-02"), req.Hours, req.Description)
 	if err != nil {
 		return nil, err
 	}
 	return map[string]interface{}{"id": id}, nil
 }
 
-func (h *handlers) resolveContract(id int, number string) (int, int, error) {
+func (h *handlers) resolveContract(userID int64, id int, number string) (int, int, error) {
 	if id != 0 {
 		var clientID int
-		err := h.db.QueryRow(`SELECT client_id FROM contracts WHERE id = ? AND status = 'active'`, id).Scan(&clientID)
+		err := h.db.QueryRow(`SELECT client_id FROM contracts WHERE id = ? AND user_id = ? AND status = 'active'`, id, userID).Scan(&clientID)
 		if err == sql.ErrNoRows {
 			return 0, 0, newAPIError(http.StatusNotFound, "contract %d not found or not active", id)
 		}
@@ -780,7 +911,7 @@ func (h *handlers) resolveContract(id int, number string) (int, int, error) {
 	}
 	if number != "" {
 		var contractID, clientID int
-		err := h.db.QueryRow(`SELECT id, client_id FROM contracts WHERE contract_number = ? AND status = 'active'`, number).Scan(&contractID, &clientID)
+		err := h.db.QueryRow(`SELECT id, client_id FROM contracts WHERE contract_number = ? AND user_id = ? AND status = 'active'`, number, userID).Scan(&contractID, &clientID)
 		if err == sql.ErrNoRows {
 			return 0, 0, newAPIError(http.StatusNotFound, "contract %s not found or not active", number)
 		}
@@ -797,6 +928,10 @@ type bulkAddReq struct {
 }
 
 func (h *handlers) bulkAddTimeEntries(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	var req bulkAddReq
 	if err := decodeBody(r, &req); err != nil {
 		return nil, err
@@ -811,7 +946,7 @@ func (h *handlers) bulkAddTimeEntries(w http.ResponseWriter, r *http.Request) (i
 	defer tx.Rollback()
 	ids := []string{}
 	for _, e := range req.Entries {
-		contractID, clientID, err := h.resolveContract(e.ContractID, e.ContractNumber)
+		contractID, clientID, err := h.resolveContract(userID, e.ContractID, e.ContractNumber)
 		if err != nil {
 			return nil, err
 		}
@@ -821,9 +956,9 @@ func (h *handlers) bulkAddTimeEntries(w http.ResponseWriter, r *http.Request) (i
 		}
 		id := uuid.New().String()
 		if _, err := tx.Exec(`
-			INSERT INTO time_entries (id, client_id, contract_id, date, hours, description)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, id, clientID, contractID, date.Format("2006-01-02"), e.Hours, e.Description); err != nil {
+			INSERT INTO time_entries (id, user_id, client_id, contract_id, date, hours, description)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, id, userID, clientID, contractID, date.Format("2006-01-02"), e.Hours, e.Description); err != nil {
 			return nil, err
 		}
 		ids = append(ids, id)
@@ -841,11 +976,15 @@ type updateTimeEntryReq struct {
 }
 
 func (h *handlers) updateTimeEntry(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	id := r.PathValue("id")
 	var existing struct {
 		InvoiceID *int
 	}
-	err := h.db.QueryRow(`SELECT invoice_id FROM time_entries WHERE id = ?`, id).Scan(&existing.InvoiceID)
+	err = h.db.QueryRow(`SELECT invoice_id FROM time_entries WHERE id = ? AND user_id = ?`, id, userID).Scan(&existing.InvoiceID)
 	if err == sql.ErrNoRows {
 		return nil, newAPIError(http.StatusNotFound, "entry not found")
 	}
@@ -880,16 +1019,20 @@ func (h *handlers) updateTimeEntry(w http.ResponseWriter, r *http.Request) (inte
 	if len(sets) == 0 {
 		return nil, newAPIError(http.StatusBadRequest, "no fields")
 	}
-	args = append(args, id)
-	if _, err := h.db.Exec(fmt.Sprintf("UPDATE time_entries SET %s WHERE id = ?", strings.Join(sets, ", ")), args...); err != nil {
+	args = append(args, id, userID)
+	if _, err := h.db.Exec(fmt.Sprintf("UPDATE time_entries SET %s WHERE id = ? AND user_id = ?", strings.Join(sets, ", ")), args...); err != nil {
 		return nil, err
 	}
 	return map[string]interface{}{"id": id}, nil
 }
 
 func (h *handlers) deleteTimeEntry(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	id := r.PathValue("id")
-	res, err := h.db.Exec(`DELETE FROM time_entries WHERE id = ?`, id)
+	res, err := h.db.Exec(`DELETE FROM time_entries WHERE id = ? AND user_id = ?`, id, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -905,6 +1048,10 @@ type bulkIDsReq struct {
 }
 
 func (h *handlers) bulkDeleteTimeEntries(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	var req bulkIDsReq
 	if err := decodeBody(r, &req); err != nil {
 		return nil, err
@@ -919,7 +1066,7 @@ func (h *handlers) bulkDeleteTimeEntries(w http.ResponseWriter, r *http.Request)
 	defer tx.Rollback()
 	count := 0
 	for _, id := range req.IDs {
-		res, err := tx.Exec(`DELETE FROM time_entries WHERE id = ?`, id)
+		res, err := tx.Exec(`DELETE FROM time_entries WHERE id = ? AND user_id = ?`, id, userID)
 		if err != nil {
 			return nil, err
 		}
@@ -938,12 +1085,16 @@ type markInvoicedReq struct {
 }
 
 func (h *handlers) markTimeEntriesInvoiced(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	var req markInvoicedReq
 	if err := decodeBody(r, &req); err != nil {
 		return nil, err
 	}
 	var invoiceID int
-	err := h.db.QueryRow(`SELECT id FROM invoices WHERE invoice_number = ?`, req.InvoiceNumber).Scan(&invoiceID)
+	err = h.db.QueryRow(`SELECT id FROM invoices WHERE invoice_number = ? AND user_id = ?`, req.InvoiceNumber, userID).Scan(&invoiceID)
 	if err == sql.ErrNoRows {
 		return nil, newAPIError(http.StatusNotFound, "invoice not found")
 	}
@@ -958,13 +1109,13 @@ func (h *handlers) markTimeEntriesInvoiced(w http.ResponseWriter, r *http.Reques
 	count := 0
 	for _, id := range req.IDs {
 		var existing *int
-		if err := tx.QueryRow(`SELECT invoice_id FROM time_entries WHERE id = ?`, id).Scan(&existing); err != nil {
+		if err := tx.QueryRow(`SELECT invoice_id FROM time_entries WHERE id = ? AND user_id = ?`, id, userID).Scan(&existing); err != nil {
 			continue
 		}
 		if existing != nil {
 			return nil, newAPIError(http.StatusConflict, "entry %s is already invoiced", id)
 		}
-		res, err := tx.Exec(`UPDATE time_entries SET invoice_id = ? WHERE id = ?`, invoiceID, id)
+		res, err := tx.Exec(`UPDATE time_entries SET invoice_id = ? WHERE id = ? AND user_id = ?`, invoiceID, id, userID)
 		if err != nil {
 			return nil, err
 		}
@@ -978,6 +1129,10 @@ func (h *handlers) markTimeEntriesInvoiced(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *handlers) unmarkTimeEntries(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	var req bulkIDsReq
 	if err := decodeBody(r, &req); err != nil {
 		return nil, err
@@ -989,7 +1144,7 @@ func (h *handlers) unmarkTimeEntries(w http.ResponseWriter, r *http.Request) (in
 	defer tx.Rollback()
 	count := 0
 	for _, id := range req.IDs {
-		res, err := tx.Exec(`UPDATE time_entries SET invoice_id = NULL WHERE id = ?`, id)
+		res, err := tx.Exec(`UPDATE time_entries SET invoice_id = NULL WHERE id = ? AND user_id = ?`, id, userID)
 		if err != nil {
 			return nil, err
 		}
@@ -1005,14 +1160,18 @@ func (h *handlers) unmarkTimeEntries(w http.ResponseWriter, r *http.Request) (in
 // ---------- Invoices ----------
 
 func (h *handlers) listInvoices(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	q := `
 		SELECT i.id, i.invoice_number, i.client_id, c.name, i.issue_date, i.due_date,
 		       i.total_amount, i.status, COALESCE(i.pdf_path,''), i.created_at
 		FROM invoices i
 		JOIN clients c ON i.client_id = c.id
-		WHERE 1=1
+		WHERE i.user_id = ?
 	`
-	args := []interface{}{}
+	args := []interface{}{userID}
 	qv := r.URL.Query()
 	if v := qv.Get("client_id"); v != "" {
 		q += " AND i.client_id = ?"
@@ -1049,15 +1208,19 @@ type invoiceDetailsResponse struct {
 }
 
 func (h *handlers) getInvoiceDetails(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	number := r.PathValue("number")
 	var inv invoiceDTO
-	err := h.db.QueryRow(`
+	err = h.db.QueryRow(`
 		SELECT i.id, i.invoice_number, i.client_id, c.name, i.issue_date, i.due_date,
 		       i.total_amount, i.status, COALESCE(i.pdf_path,''), i.created_at
 		FROM invoices i
 		JOIN clients c ON i.client_id = c.id
-		WHERE i.invoice_number = ?
-	`, number).Scan(&inv.ID, &inv.InvoiceNumber, &inv.ClientID, &inv.ClientName,
+		WHERE i.invoice_number = ? AND i.user_id = ?
+	`, number, userID).Scan(&inv.ID, &inv.InvoiceNumber, &inv.ClientID, &inv.ClientName,
 		&inv.IssueDate, &inv.DueDate, &inv.TotalAmount, &inv.Status, &inv.PDFPath, &inv.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, newAPIError(http.StatusNotFound, "invoice not found")
@@ -1072,9 +1235,9 @@ func (h *handlers) getInvoiceDetails(w http.ResponseWriter, r *http.Request) (in
 		JOIN contracts ct ON te.contract_id = ct.id
 		JOIN clients cl ON ct.client_id = cl.id
 		LEFT JOIN invoices i ON te.invoice_id = i.id
-		WHERE te.invoice_id = ?
+		WHERE te.invoice_id = ? AND te.user_id = ?
 		ORDER BY te.date
-	`, inv.ID)
+	`, inv.ID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -1092,9 +1255,9 @@ func (h *handlers) getInvoiceDetails(w http.ResponseWriter, r *http.Request) (in
 		JOIN clients c ON c.id = e.client_id
 		LEFT JOIN contracts ct ON ct.id = e.contract_id
 		LEFT JOIN invoices i ON i.id = e.invoice_id
-		WHERE e.invoice_id = ?
+		WHERE e.invoice_id = ? AND e.user_id = ?
 		ORDER BY e.date
-	`, inv.ID)
+	`, inv.ID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -1140,16 +1303,20 @@ type invoicePreviewResponse struct {
 }
 
 func (h *handlers) getInvoicePreview(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	number := r.PathValue("number")
 
 	var inv invoiceDTO
-	err := h.db.QueryRow(`
+	err = h.db.QueryRow(`
 		SELECT i.id, i.invoice_number, i.client_id, c.name, i.issue_date, i.due_date,
 		       i.total_amount, i.status, COALESCE(i.pdf_path,''), i.created_at
 		FROM invoices i
 		JOIN clients c ON i.client_id = c.id
-		WHERE i.invoice_number = ?
-	`, number).Scan(&inv.ID, &inv.InvoiceNumber, &inv.ClientID, &inv.ClientName,
+		WHERE i.invoice_number = ? AND i.user_id = ?
+	`, number, userID).Scan(&inv.ID, &inv.InvoiceNumber, &inv.ClientID, &inv.ClientName,
 		&inv.IssueDate, &inv.DueDate, &inv.TotalAmount, &inv.Status, &inv.PDFPath, &inv.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, newAPIError(http.StatusNotFound, "invoice not found")
@@ -1162,8 +1329,8 @@ func (h *handlers) getInvoicePreview(w http.ResponseWriter, r *http.Request) (in
 	if err := h.db.QueryRow(`
 		SELECT id, name, COALESCE(address,''), COALESCE(city,''), COALESCE(state,''),
 		       COALESCE(zip_code,''), COALESCE(country,'')
-		FROM clients WHERE id = ?
-	`, inv.ClientID).Scan(&client.ID, &client.Name, &client.Address, &client.City,
+		FROM clients WHERE id = ? AND user_id = ?
+	`, inv.ClientID, userID).Scan(&client.ID, &client.Name, &client.Address, &client.City,
 		&client.State, &client.ZipCode, &client.Country); err != nil {
 		return nil, err
 	}
@@ -1175,9 +1342,9 @@ func (h *handlers) getInvoicePreview(w http.ResponseWriter, r *http.Request) (in
 		JOIN contracts ct ON te.contract_id = ct.id
 		JOIN clients cl ON ct.client_id = cl.id
 		LEFT JOIN invoices i ON te.invoice_id = i.id
-		WHERE te.invoice_id = ?
+		WHERE te.invoice_id = ? AND te.user_id = ?
 		ORDER BY te.date
-	`, inv.ID)
+	`, inv.ID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -1193,8 +1360,8 @@ func (h *handlers) getInvoicePreview(w http.ResponseWriter, r *http.Request) (in
 		SELECT id, client_id, contract_number, name, hourly_rate, currency,
 		       contract_type, start_date, end_date, status, COALESCE(payment_terms,''),
 		       COALESCE(notes,''), created_at, updated_at
-		FROM contracts WHERE client_id = ?
-	`, inv.ClientID)
+		FROM contracts WHERE client_id = ? AND user_id = ?
+	`, inv.ClientID, userID)
 	contractByID := map[int]models.Contract{}
 	if contractRows != nil {
 		for contractRows.Next() {
@@ -1223,13 +1390,20 @@ func (h *handlers) getInvoicePreview(w http.ResponseWriter, r *http.Request) (in
 		}
 	}
 
-	payment := ResolveInvoicePaymentDetails(h.db, int64(inv.ID), inv.ClientID)
+	payment := ResolveInvoicePaymentDetails(h.db, userID, int64(inv.ID), inv.ClientID)
 
+	// Defense-in-depth: even though the invoice→client linkage was already
+	// scoped by user_id above, every recipient/payment-details query also
+	// re-checks ownership via a subquery so a future bug that propagates a
+	// stale or attacker-supplied client_id can't leak rows.
 	var recipients []models.Recipient
 	recRows, _ := h.db.Query(`
 		SELECT id, client_id, name, email, COALESCE(title,''), COALESCE(phone,''), is_primary, created_at
-		FROM recipients WHERE client_id = ? ORDER BY is_primary DESC
-	`, inv.ClientID)
+		FROM recipients
+		WHERE client_id = ?
+		  AND client_id IN (SELECT id FROM clients WHERE user_id = ?)
+		ORDER BY is_primary DESC
+	`, inv.ClientID, userID)
 	if recRows != nil {
 		for recRows.Next() {
 			var rcp models.Recipient
@@ -1242,17 +1416,7 @@ func (h *handlers) getInvoicePreview(w http.ResponseWriter, r *http.Request) (in
 		recRows.Close()
 	}
 
-	var business models.BusinessInfo
-	_ = h.db.QueryRow(`
-		SELECT id, business_name, contact_name, email, COALESCE(phone,''), COALESCE(address,''),
-		       COALESCE(city,''), COALESCE(state,''), COALESCE(zip_code,''), COALESCE(country,''),
-		       COALESCE(tax_id,''), COALESCE(website,''), COALESCE(logo_path,''),
-		       COALESCE(invoice_prefix,'INV'), COALESCE(export_path,''), updated_at
-		FROM business_info WHERE id = 1
-	`).Scan(&business.ID, &business.BusinessName, &business.ContactName, &business.Email,
-		&business.Phone, &business.Address, &business.City, &business.State,
-		&business.ZipCode, &business.Country, &business.TaxID, &business.Website,
-		&business.LogoPath, &business.InvoicePrefix, &business.ExportPath, &business.UpdatedAt)
+	business := loadBusinessInfo(h.db, userID)
 
 	previewExpRows, err := h.db.Query(`
 		SELECT e.id, e.client_id, c.name, e.contract_id, COALESCE(ct.contract_number,''),
@@ -1263,9 +1427,9 @@ func (h *handlers) getInvoicePreview(w http.ResponseWriter, r *http.Request) (in
 		JOIN clients c ON c.id = e.client_id
 		LEFT JOIN contracts ct ON ct.id = e.contract_id
 		LEFT JOIN invoices i ON i.id = e.invoice_id
-		WHERE e.invoice_id = ?
+		WHERE e.invoice_id = ? AND e.user_id = ?
 		ORDER BY e.date
-	`, inv.ID)
+	`, inv.ID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -1309,6 +1473,10 @@ type createInvoiceReq struct {
 }
 
 func (h *handlers) createInvoice(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	var req createInvoiceReq
 	if err := decodeBody(r, &req); err != nil {
 		return nil, err
@@ -1316,13 +1484,16 @@ func (h *handlers) createInvoice(w http.ResponseWriter, r *http.Request) (interf
 	if req.ClientID == 0 {
 		return nil, newAPIError(http.StatusBadRequest, "client_id required")
 	}
+	if _, err := h.requireClient(userID, req.ClientID); err != nil {
+		return nil, err
+	}
 	if req.DueDays == 0 {
 		req.DueDays = 30
 	}
 
 	// Business info validation
 	var businessName string
-	err := h.db.QueryRow(`SELECT business_name FROM business_info WHERE id = 1`).Scan(&businessName)
+	err = h.db.QueryRow(`SELECT business_name FROM business_info WHERE user_id = ?`, userID).Scan(&businessName)
 	if err == sql.ErrNoRows {
 		return nil, newAPIError(http.StatusPreconditionFailed, "business info not configured")
 	}
@@ -1359,8 +1530,8 @@ func (h *handlers) createInvoice(w http.ResponseWriter, r *http.Request) (interf
 	err = h.db.QueryRow(`
 		SELECT id, name, COALESCE(address,''), COALESCE(city,''), COALESCE(state,''),
 		       COALESCE(zip_code,''), COALESCE(country,'')
-		FROM clients WHERE id = ?
-	`, req.ClientID).Scan(&client.ID, &client.Name, &client.Address, &client.City, &client.State, &client.ZipCode, &client.Country)
+		FROM clients WHERE id = ? AND user_id = ?
+	`, req.ClientID, userID).Scan(&client.ID, &client.Name, &client.Address, &client.City, &client.State, &client.ZipCode, &client.Country)
 	if err == sql.ErrNoRows {
 		return nil, newAPIError(http.StatusNotFound, "client not found")
 	}
@@ -1374,9 +1545,9 @@ func (h *handlers) createInvoice(w http.ResponseWriter, r *http.Request) (interf
 		       ct.id, ct.contract_number, ct.name, COALESCE(ct.payment_terms,'')
 		FROM time_entries te
 		JOIN contracts ct ON te.contract_id = ct.id
-		WHERE ct.client_id = ? AND te.date >= ? AND te.date <= ? AND te.invoice_id IS NULL
+		WHERE ct.client_id = ? AND te.user_id = ? AND te.date >= ? AND te.date <= ? AND te.invoice_id IS NULL
 		ORDER BY te.date
-	`, req.ClientID, startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
+	`, req.ClientID, userID, startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
 	if err != nil {
 		return nil, err
 	}
@@ -1408,9 +1579,9 @@ func (h *handlers) createInvoice(w http.ResponseWriter, r *http.Request) (interf
 		SELECT id, client_id, contract_id, date, description, amount, currency,
 		       COALESCE(category,''), COALESCE(receipt_path,'')
 		FROM expenses
-		WHERE client_id = ? AND date >= ? AND date <= ? AND invoice_id IS NULL
+		WHERE client_id = ? AND user_id = ? AND date >= ? AND date <= ? AND invoice_id IS NULL
 		ORDER BY date
-	`, req.ClientID, startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
+	`, req.ClientID, userID, startDate.Format("2006-01-02"), endDate.Format("2006-01-02"))
 	if err != nil {
 		return nil, err
 	}
@@ -1444,12 +1615,12 @@ func (h *handlers) createInvoice(w http.ResponseWriter, r *http.Request) (interf
 
 	// Snapshot the payment method from the client's contract so the invoice
 	// stays stable even if the contract's method changes later.
-	paymentMethodID := resolveContractPaymentMethodID(h.db, req.ClientID)
+	paymentMethodID := resolveContractPaymentMethodID(h.db, userID, req.ClientID)
 
 	res, err := tx.Exec(`
-		INSERT INTO invoices (client_id, invoice_number, issue_date, due_date, total_amount, status, payment_method_id)
-		VALUES (?, ?, ?, ?, ?, 'pending', ?)
-	`, req.ClientID, invoiceNumber, issueDate.Format("2006-01-02"), dueDate.Format("2006-01-02"), totalAmount,
+		INSERT INTO invoices (user_id, client_id, invoice_number, issue_date, due_date, total_amount, status, payment_method_id)
+		VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+	`, userID, req.ClientID, invoiceNumber, issueDate.Format("2006-01-02"), dueDate.Format("2006-01-02"), totalAmount,
 		paymentMethodID)
 	if err != nil {
 		return nil, err
@@ -1457,25 +1628,28 @@ func (h *handlers) createInvoice(w http.ResponseWriter, r *http.Request) (interf
 	invoiceID, _ := res.LastInsertId()
 
 	for _, e := range entries {
-		if _, err := tx.Exec(`UPDATE time_entries SET invoice_id = ? WHERE id = ?`, invoiceID, e.ID); err != nil {
+		if _, err := tx.Exec(`UPDATE time_entries SET invoice_id = ? WHERE id = ? AND user_id = ?`, invoiceID, e.ID, userID); err != nil {
 			return nil, err
 		}
 	}
 	for _, ex := range expenses {
-		if _, err := tx.Exec(`UPDATE expenses SET invoice_id = ? WHERE id = ?`, invoiceID, ex.ID); err != nil {
+		if _, err := tx.Exec(`UPDATE expenses SET invoice_id = ? WHERE id = ? AND user_id = ?`, invoiceID, ex.ID, userID); err != nil {
 			return nil, err
 		}
 	}
 
 	// Gather info for PDF. We read payment through the helper so the
 	// snapshot on this just-inserted invoice wins over legacy data.
-	paymentDetails := ResolveInvoicePaymentDetails(h.db, invoiceID, req.ClientID)
+	paymentDetails := ResolveInvoicePaymentDetails(h.db, userID, invoiceID, req.ClientID)
 
 	var recipients []models.Recipient
 	recRows, _ := tx.Query(`
 		SELECT name, email, COALESCE(title,''), COALESCE(phone,'')
-		FROM recipients WHERE client_id = ? ORDER BY is_primary DESC
-	`, req.ClientID)
+		FROM recipients
+		WHERE client_id = ?
+		  AND client_id IN (SELECT id FROM clients WHERE user_id = ?)
+		ORDER BY is_primary DESC
+	`, req.ClientID, userID)
 	if recRows != nil {
 		for recRows.Next() {
 			var rcp models.Recipient
@@ -1485,20 +1659,15 @@ func (h *handlers) createInvoice(w http.ResponseWriter, r *http.Request) (interf
 		recRows.Close()
 	}
 
-	var business models.BusinessInfo
-	tx.QueryRow(`
-		SELECT id, business_name, contact_name, email, COALESCE(phone,''), COALESCE(address,''),
-		       COALESCE(city,''), COALESCE(state,''), COALESCE(zip_code,''), COALESCE(country,''),
-		       COALESCE(tax_id,''), COALESCE(website,''), COALESCE(logo_path,''), COALESCE(invoice_prefix,'INV'),
-		       COALESCE(export_path,''), updated_at
-		FROM business_info WHERE id = 1
-	`).Scan(&business.ID, &business.BusinessName, &business.ContactName, &business.Email,
-		&business.Phone, &business.Address, &business.City, &business.State,
-		&business.ZipCode, &business.Country, &business.TaxID, &business.Website,
-		&business.LogoPath, &business.InvoicePrefix, &business.ExportPath, &business.UpdatedAt)
+	business := loadBusinessInfo(h.db, userID)
 
-	exportDir := resolveExportDir(business.ExportPath)
-	if err := os.MkdirAll(exportDir, 0o755); err != nil {
+	// All per-user file output is confined to a fixed per-user directory
+	// under the server's home. The legacy business_info.export_path field
+	// is intentionally ignored (it was a path-traversal footgun and has no
+	// use case in the multi-tenant deployment — files written there were
+	// invisible to the tenant anyway).
+	exportDir, err := userExportDir(userID)
+	if err != nil {
 		return nil, newAPIError(http.StatusInternalServerError, "failed to create export dir: %s", err)
 	}
 	pdfPath := filepath.Join(exportDir, fmt.Sprintf("invoice_%s_%s.pdf", invoiceNumber, issueDate.Format("2006-01-02")))
@@ -1521,7 +1690,7 @@ func (h *handlers) createInvoice(w http.ResponseWriter, r *http.Request) (interf
 		return nil, newAPIError(http.StatusInternalServerError, "failed to generate PDF: %s", err)
 	}
 
-	if _, err := tx.Exec(`UPDATE invoices SET pdf_path = ? WHERE id = ?`, pdfPath, invoiceID); err != nil {
+	if _, err := tx.Exec(`UPDATE invoices SET pdf_path = ? WHERE id = ? AND user_id = ?`, pdfPath, invoiceID, userID); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1544,6 +1713,10 @@ type updateInvoiceStatusReq struct {
 }
 
 func (h *handlers) updateInvoiceStatus(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	number := r.PathValue("number")
 	var req updateInvoiceStatusReq
 	if err := decodeBody(r, &req); err != nil {
@@ -1553,7 +1726,7 @@ func (h *handlers) updateInvoiceStatus(w http.ResponseWriter, r *http.Request) (
 	if !valid[req.Status] {
 		return nil, newAPIError(http.StatusBadRequest, "invalid status")
 	}
-	res, err := h.db.Exec(`UPDATE invoices SET status = ? WHERE invoice_number = ?`, req.Status, number)
+	res, err := h.db.Exec(`UPDATE invoices SET status = ? WHERE invoice_number = ? AND user_id = ?`, req.Status, number, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -1561,7 +1734,7 @@ func (h *handlers) updateInvoiceStatus(w http.ResponseWriter, r *http.Request) (
 	if n == 0 {
 		return nil, newAPIError(http.StatusNotFound, "invoice not found")
 	}
-	BroadcastEvent("invoice.updated", map[string]any{
+	BroadcastUserEvent(userID, "invoice.updated", map[string]any{
 		"source":         "api",
 		"invoice_number": number,
 		"status":         req.Status,
@@ -1570,13 +1743,17 @@ func (h *handlers) updateInvoiceStatus(w http.ResponseWriter, r *http.Request) (
 }
 
 func (h *handlers) deleteInvoice(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	number := r.PathValue("number")
 
 	var id int64
 	var status, pdfPath string
-	err := h.db.QueryRow(
-		`SELECT id, status, COALESCE(pdf_path,'') FROM invoices WHERE invoice_number = ?`,
-		number,
+	err = h.db.QueryRow(
+		`SELECT id, status, COALESCE(pdf_path,'') FROM invoices WHERE invoice_number = ? AND user_id = ?`,
+		number, userID,
 	).Scan(&id, &status, &pdfPath)
 	if err == sql.ErrNoRows {
 		return nil, newAPIError(http.StatusNotFound, "invoice not found")
@@ -1596,11 +1773,11 @@ func (h *handlers) deleteInvoice(w http.ResponseWriter, r *http.Request) (interf
 	defer tx.Rollback()
 
 	if _, err := tx.Exec(
-		`UPDATE time_entries SET invoice_id = NULL WHERE invoice_id = ?`, id,
+		`UPDATE time_entries SET invoice_id = NULL WHERE invoice_id = ? AND user_id = ?`, id, userID,
 	); err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(`DELETE FROM invoices WHERE id = ?`, id); err != nil {
+	if _, err := tx.Exec(`DELETE FROM invoices WHERE id = ? AND user_id = ?`, id, userID); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1611,7 +1788,7 @@ func (h *handlers) deleteInvoice(w http.ResponseWriter, r *http.Request) (interf
 		_ = os.Remove(pdfPath)
 	}
 
-	BroadcastEvent("invoice.deleted", map[string]any{
+	BroadcastUserEvent(userID, "invoice.deleted", map[string]any{
 		"source":         "api",
 		"invoice_number": number,
 	})
@@ -1621,14 +1798,18 @@ func (h *handlers) deleteInvoice(w http.ResponseWriter, r *http.Request) (interf
 // ---------- Business Info ----------
 
 func (h *handlers) getBusinessInfo(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	var b models.BusinessInfo
-	err := h.db.QueryRow(`
-		SELECT id, business_name, contact_name, email, COALESCE(phone,''), COALESCE(address,''),
+	err = h.db.QueryRow(`
+		SELECT user_id, business_name, contact_name, email, COALESCE(phone,''), COALESCE(address,''),
 		       COALESCE(city,''), COALESCE(state,''), COALESCE(zip_code,''), COALESCE(country,''),
 		       COALESCE(tax_id,''), COALESCE(website,''), COALESCE(logo_path,''), COALESCE(invoice_prefix,'INV'),
 		       COALESCE(export_path,''), updated_at
-		FROM business_info WHERE id = 1
-	`).Scan(&b.ID, &b.BusinessName, &b.ContactName, &b.Email, &b.Phone, &b.Address, &b.City, &b.State,
+		FROM business_info WHERE user_id = ?
+	`, userID).Scan(&b.ID, &b.BusinessName, &b.ContactName, &b.Email, &b.Phone, &b.Address, &b.City, &b.State,
 		&b.ZipCode, &b.Country, &b.TaxID, &b.Website, &b.LogoPath, &b.InvoicePrefix, &b.ExportPath, &b.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -1637,6 +1818,23 @@ func (h *handlers) getBusinessInfo(w http.ResponseWriter, r *http.Request) (inte
 		return nil, err
 	}
 	return b, nil
+}
+
+// loadBusinessInfo is the package-internal lookup used by invoice/quote PDF
+// flows that need the business block alongside other tenant-scoped data.
+// Returns a zero value (the PDF layer is tolerant of empty fields) when the
+// user hasn't configured their business details yet.
+func loadBusinessInfo(db *sql.DB, userID int64) models.BusinessInfo {
+	var b models.BusinessInfo
+	_ = db.QueryRow(`
+		SELECT user_id, business_name, contact_name, email, COALESCE(phone,''), COALESCE(address,''),
+		       COALESCE(city,''), COALESCE(state,''), COALESCE(zip_code,''), COALESCE(country,''),
+		       COALESCE(tax_id,''), COALESCE(website,''), COALESCE(logo_path,''), COALESCE(invoice_prefix,'INV'),
+		       COALESCE(export_path,''), updated_at
+		FROM business_info WHERE user_id = ?
+	`, userID).Scan(&b.ID, &b.BusinessName, &b.ContactName, &b.Email, &b.Phone, &b.Address, &b.City, &b.State,
+		&b.ZipCode, &b.Country, &b.TaxID, &b.Website, &b.LogoPath, &b.InvoicePrefix, &b.ExportPath, &b.UpdatedAt)
+	return b
 }
 
 type businessInfoReq struct {
@@ -1651,12 +1849,22 @@ type businessInfoReq struct {
 	Country       string `json:"country,omitempty"`
 	TaxID         string `json:"tax_id,omitempty"`
 	Website       string `json:"website,omitempty"`
+	// LogoPath and ExportPath are accepted for backcompat but never used:
+	// LogoPath is no longer dereferenced by any code path (the PDF renderer
+	// doesn't embed logos), and ExportPath was a path-traversal footgun
+	// replaced by a per-user fixed export dir. Both fields are accepted
+	// from the request so old clients don't error, but the values are
+	// silently ignored at the SQL layer below.
 	LogoPath      string `json:"logo_path,omitempty"`
 	InvoicePrefix string `json:"invoice_prefix,omitempty"`
 	ExportPath    string `json:"export_path,omitempty"`
 }
 
 func (h *handlers) setBusinessInfo(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	var req businessInfoReq
 	if err := decodeBody(r, &req); err != nil {
 		return nil, err
@@ -1664,11 +1872,15 @@ func (h *handlers) setBusinessInfo(w http.ResponseWriter, r *http.Request) (inte
 	if req.InvoicePrefix == "" {
 		req.InvoicePrefix = "INV"
 	}
-	_, err := h.db.Exec(`
-		INSERT INTO business_info (id, business_name, contact_name, email, phone, address, city, state,
+	// Force logo_path and export_path to empty regardless of what the client
+	// sends — see businessInfoReq for rationale. We pass empty strings into
+	// the SQL so that an existing stored value is also blanked on update,
+	// closing out any leftover risky path that an earlier version persisted.
+	_, err = h.db.Exec(`
+		INSERT INTO business_info (user_id, business_name, contact_name, email, phone, address, city, state,
 		                         zip_code, country, tax_id, website, logo_path, invoice_prefix, export_path, updated_at)
-		VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(user_id) DO UPDATE SET
 			business_name = excluded.business_name,
 			contact_name = excluded.contact_name,
 			email = excluded.email,
@@ -1684,8 +1896,8 @@ func (h *handlers) setBusinessInfo(w http.ResponseWriter, r *http.Request) (inte
 			invoice_prefix = excluded.invoice_prefix,
 			export_path = excluded.export_path,
 			updated_at = excluded.updated_at
-	`, req.BusinessName, req.ContactName, req.Email, req.Phone, req.Address, req.City, req.State,
-		req.ZipCode, req.Country, req.TaxID, req.Website, req.LogoPath, req.InvoicePrefix, req.ExportPath, time.Now())
+	`, userID, req.BusinessName, req.ContactName, req.Email, req.Phone, req.Address, req.City, req.State,
+		req.ZipCode, req.Country, req.TaxID, req.Website, "", req.InvoicePrefix, "", time.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -1705,23 +1917,43 @@ func parseDate(s string) (time.Time, error) {
 	return t, nil
 }
 
-func resolveExportDir(configured string) string {
-	home, _ := os.UserHomeDir()
-	p := strings.TrimSpace(configured)
-	if p == "" {
-		return filepath.Join(home, "Downloads")
+// userExportDir returns the absolute directory under which all server-side
+// PDF output for the given user is written, creating it if it doesn't yet
+// exist. The location is fixed (~/.hours/exports/<user_id>) — the legacy
+// business_info.export_path setting is intentionally not honored here, since
+// letting a tenant choose an arbitrary filesystem path is a traversal vector
+// and has no meaningful use case behind a server deployment where the tenant
+// can't see the host filesystem anyway.
+func userExportDir(userID int64) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
 	}
-	if strings.HasPrefix(p, "~/") {
-		p = filepath.Join(home, p[2:])
-	} else if p == "~" {
-		p = home
+	dir := filepath.Join(home, ".hours", "exports", strconv.FormatInt(userID, 10))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
 	}
-	return p
+	return dir, nil
 }
 
 // ---------- Invoice download ----------
 
-func (h *handlers) downloadInvoice(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+// downloadInvoice streams the rendered invoice PDF as the HTTP response body
+// with a Content-Disposition: attachment header. Both --serve mode (browser)
+// and Wails mode (in-process httptest dispatch) consume the same bytes — the
+// Wails frontend wraps the response in a native Save-As dialog rather than a
+// browser download.
+//
+// The previous implementation wrote the PDF to ~/Downloads on the SERVER's
+// filesystem, which is meaningless inside a Docker container and was the H3
+// path-traversal vector flagged in the security review. This handler never
+// touches the server filesystem.
+func (h *handlers) downloadInvoice(w http.ResponseWriter, r *http.Request) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err)
+		return
+	}
 	number := r.PathValue("number")
 
 	var inv struct {
@@ -1731,27 +1963,29 @@ func (h *handlers) downloadInvoice(w http.ResponseWriter, r *http.Request) (inte
 		DueDate     time.Time
 		TotalAmount float64
 		Status      string
-		PDFPath     string
 	}
-	err := h.db.QueryRow(`
-		SELECT id, client_id, issue_date, due_date, total_amount, status, COALESCE(pdf_path,'')
-		FROM invoices WHERE invoice_number = ?
-	`, number).Scan(&inv.ID, &inv.ClientID, &inv.IssueDate, &inv.DueDate, &inv.TotalAmount, &inv.Status, &inv.PDFPath)
+	err = h.db.QueryRow(`
+		SELECT id, client_id, issue_date, due_date, total_amount, status
+		FROM invoices WHERE invoice_number = ? AND user_id = ?
+	`, number, userID).Scan(&inv.ID, &inv.ClientID, &inv.IssueDate, &inv.DueDate, &inv.TotalAmount, &inv.Status)
 	if err == sql.ErrNoRows {
-		return nil, newAPIError(http.StatusNotFound, "invoice not found")
+		writeError(w, http.StatusNotFound, fmt.Errorf("invoice not found"))
+		return
 	}
 	if err != nil {
-		return nil, err
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	var client models.Client
 	err = h.db.QueryRow(`
 		SELECT id, name, COALESCE(address,''), COALESCE(city,''), COALESCE(state,''),
 		       COALESCE(zip_code,''), COALESCE(country,'')
-		FROM clients WHERE id = ?
-	`, inv.ClientID).Scan(&client.ID, &client.Name, &client.Address, &client.City, &client.State, &client.ZipCode, &client.Country)
+		FROM clients WHERE id = ? AND user_id = ?
+	`, inv.ClientID, userID).Scan(&client.ID, &client.Name, &client.Address, &client.City, &client.State, &client.ZipCode, &client.Country)
 	if err != nil {
-		return nil, err
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	rows, err := h.db.Query(`
@@ -1759,11 +1993,12 @@ func (h *handlers) downloadInvoice(w http.ResponseWriter, r *http.Request) (inte
 		       ct.id, ct.contract_number, ct.name, COALESCE(ct.payment_terms,'')
 		FROM time_entries te
 		JOIN contracts ct ON te.contract_id = ct.id
-		WHERE te.invoice_id = ?
+		WHERE te.invoice_id = ? AND te.user_id = ?
 		ORDER BY te.date
-	`, inv.ID)
+	`, inv.ID, userID)
 	if err != nil {
-		return nil, err
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 	defer rows.Close()
 
@@ -1775,7 +2010,8 @@ func (h *handlers) downloadInvoice(w http.ResponseWriter, r *http.Request) (inte
 		var contract models.Contract
 		if err := rows.Scan(&e.ID, &e.Date, &e.Hours, &e.Description, &rate, &currency,
 			&contract.ID, &contract.ContractNumber, &contract.Name, &contract.PaymentTerms); err != nil {
-			return nil, err
+			writeError(w, http.StatusInternalServerError, err)
+			return
 		}
 		contract.HourlyRate = rate
 		contract.Currency = currency
@@ -1784,13 +2020,16 @@ func (h *handlers) downloadInvoice(w http.ResponseWriter, r *http.Request) (inte
 		entries = append(entries, e)
 	}
 
-	paymentDetails := ResolveInvoicePaymentDetails(h.db, inv.ID, inv.ClientID)
+	paymentDetails := ResolveInvoicePaymentDetails(h.db, userID, inv.ID, inv.ClientID)
 
 	var recipients []models.Recipient
 	recRows, _ := h.db.Query(`
 		SELECT name, email, COALESCE(title,''), COALESCE(phone,'')
-		FROM recipients WHERE client_id = ? ORDER BY is_primary DESC
-	`, inv.ClientID)
+		FROM recipients
+		WHERE client_id = ?
+		  AND client_id IN (SELECT id FROM clients WHERE user_id = ?)
+		ORDER BY is_primary DESC
+	`, inv.ClientID, userID)
 	if recRows != nil {
 		for recRows.Next() {
 			var rcp models.Recipient
@@ -1800,23 +2039,7 @@ func (h *handlers) downloadInvoice(w http.ResponseWriter, r *http.Request) (inte
 		recRows.Close()
 	}
 
-	var business models.BusinessInfo
-	h.db.QueryRow(`
-		SELECT id, business_name, contact_name, email, COALESCE(phone,''), COALESCE(address,''),
-		       COALESCE(city,''), COALESCE(state,''), COALESCE(zip_code,''), COALESCE(country,''),
-		       COALESCE(tax_id,''), COALESCE(website,''), COALESCE(logo_path,''), COALESCE(invoice_prefix,'INV'),
-		       COALESCE(export_path,''), updated_at
-		FROM business_info WHERE id = 1
-	`).Scan(&business.ID, &business.BusinessName, &business.ContactName, &business.Email,
-		&business.Phone, &business.Address, &business.City, &business.State,
-		&business.ZipCode, &business.Country, &business.TaxID, &business.Website,
-		&business.LogoPath, &business.InvoicePrefix, &business.ExportPath, &business.UpdatedAt)
-
-	exportDir := resolveExportDir(business.ExportPath)
-	if err := os.MkdirAll(exportDir, 0o755); err != nil {
-		return nil, newAPIError(http.StatusInternalServerError, "failed to create export dir: %s", err)
-	}
-	pdfPath := filepath.Join(exportDir, fmt.Sprintf("invoice_%s_%s.pdf", number, inv.IssueDate.Format("2006-01-02")))
+	business := loadBusinessInfo(h.db, userID)
 
 	invoice := models.Invoice{
 		ID:            int(inv.ID),
@@ -1831,17 +2054,16 @@ func (h *handlers) downloadInvoice(w http.ResponseWriter, r *http.Request) (inte
 	}
 
 	generator := pdf.NewInvoiceGenerator()
-	if err := generator.Generate(invoice, paymentDetails, recipients, business, pdfPath); err != nil {
-		return nil, newAPIError(http.StatusInternalServerError, "failed to generate PDF: %s", err)
+	bytes, err := generator.GenerateBytes(invoice, paymentDetails, recipients, business)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("generate PDF: %w", err))
+		return
 	}
 
-	if _, err := h.db.Exec(`UPDATE invoices SET pdf_path = ? WHERE id = ?`, pdfPath, inv.ID); err != nil {
-		return nil, err
-	}
-
-	return map[string]interface{}{
-		"invoice_number": number,
-		"pdf_path":       pdfPath,
-		"export_dir":     exportDir,
-	}, nil
+	filename := fmt.Sprintf("invoice_%s_%s.pdf", number, inv.IssueDate.Format("2006-01-02"))
+	w.Header().Set("Content-Type", "application/pdf")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	w.Header().Set("Content-Length", strconv.Itoa(len(bytes)))
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(bytes)
 }

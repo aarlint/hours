@@ -1,0 +1,28 @@
+services:
+  hours:
+    build: .
+    container_name: hours
+    restart: unless-stopped
+    networks:
+      - traefik-proxy
+    labels:
+      - "traefik.docker.network=traefik-proxy"
+      - "traefik.http.services.hours.loadbalancer.server.port=7878"
+    environment:
+      OIDC_ISSUER: ${OIDC_ISSUER}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET}
+      OIDC_REDIRECT_URL: ${OIDC_REDIRECT_URL}
+      OIDC_SCOPES: ${OIDC_SCOPES:-openid profile email}
+      OIDC_COOKIE_SECURE: "1"
+      OIDC_ALLOWED_EMAILS: ${OIDC_ALLOWED_EMAILS:-}
+      OIDC_BOOTSTRAP_ADMIN_EMAILS: ${OIDC_BOOTSTRAP_ADMIN_EMAILS:-}
+    volumes:
+      - hours-data:/home/hours/.hours
+
+volumes:
+  hours-data:
+
+networks:
+  traefik-proxy:
+    external: true

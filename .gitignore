@@ -51,4 +51,6 @@ internal/web/src/wailsjs/
 *.md5
 
 # Installer artifacts
-*.pkg
+*.pkg.env
+
+.env

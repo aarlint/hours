@@ -2,6 +2,7 @@ package pdf
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/austin/hours-mcp/internal/models"
@@ -74,7 +75,10 @@ func wrapText(s string, maxWidth int) []string {
 	return out
 }
 
-func (g *InvoiceGenerator) Generate(invoice models.Invoice, payment models.PaymentDetails, recipients []models.Recipient, business models.BusinessInfo, outputPath string) error {
+// GenerateBytes builds the invoice PDF in memory and returns the encoded bytes.
+// Used by HTTP handlers that stream the PDF directly to clients without ever
+// writing it to disk on the server.
+func (g *InvoiceGenerator) GenerateBytes(invoice models.Invoice, payment models.PaymentDetails, recipients []models.Recipient, business models.BusinessInfo) ([]byte, error) {
 	cfg := config.NewBuilder().
 		WithPageSize(pagesize.Letter).
 		WithLeftMargin(15).
@@ -123,9 +127,20 @@ func (g *InvoiceGenerator) Generate(invoice models.Invoice, payment models.Payme
 
 	doc, err := m.Generate()
 	if err != nil {
-		return fmt.Errorf("failed to generate PDF: %w", err)
+		return nil, fmt.Errorf("failed to generate PDF: %w", err)
 	}
-	if err := doc.Save(outputPath); err != nil {
+	return doc.GetBytes(), nil
+}
+
+// Generate builds the PDF and writes it to outputPath. Retained so the CLI and
+// MCP tool callers (which legitimately want the file on the local filesystem)
+// keep working unchanged.
+func (g *InvoiceGenerator) Generate(invoice models.Invoice, payment models.PaymentDetails, recipients []models.Recipient, business models.BusinessInfo, outputPath string) error {
+	bytes, err := g.GenerateBytes(invoice, payment, recipients, business)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(outputPath, bytes, 0o644); err != nil {
 		return fmt.Errorf("failed to save PDF: %w", err)
 	}
 	return nil
@@ -155,8 +170,8 @@ func addMastBlock(m core.Maroto, inv models.Invoice) {
 func addRemitBlock(m core.Maroto, inv models.Invoice, biz models.BusinessInfo, recipients []models.Recipient) {
 	m.AddRow(6)
 	m.AddRow(4,
-		labelMono(6, "REMIT FROM"),
-		labelMono(6, "REMIT TO"),
+		labelMono(6, "FROM"),
+		labelMono(6, "BILL TO"),
 	)
 	m.AddRow(2)
 

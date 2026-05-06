@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/austin/hours-mcp/internal/cli/output"
+	"github.com/austin/hours-mcp/internal/database"
 	"github.com/austin/hours-mcp/internal/models"
 )
 
@@ -59,9 +60,9 @@ func (b *BusinessCommands) SetupBusiness(args []string) error {
 	}
 
 	_, err := b.db.Exec(`
-		INSERT INTO business_info (id, business_name, contact_name, email, phone, address, city, state, zip_code, country, tax_id, website, logo_path, invoice_prefix, updated_at)
-		VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
+		INSERT INTO business_info (user_id, business_name, contact_name, email, phone, address, city, state, zip_code, country, tax_id, website, logo_path, invoice_prefix, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(user_id) DO UPDATE SET
 			business_name = excluded.business_name,
 			contact_name = excluded.contact_name,
 			email = excluded.email,
@@ -76,7 +77,7 @@ func (b *BusinessCommands) SetupBusiness(args []string) error {
 			logo_path = excluded.logo_path,
 			invoice_prefix = excluded.invoice_prefix,
 			updated_at = excluded.updated_at
-	`, businessName, contactName, email, phone, address, city, state, zipCode, country, taxID, website, logoPath, invoicePrefix, time.Now())
+	`, database.DefaultUserID, businessName, contactName, email, phone, address, city, state, zipCode, country, taxID, website, logoPath, invoicePrefix, time.Now())
 
 	if err != nil {
 		return fmt.Errorf("failed to set business info: %w", err)
@@ -92,9 +93,9 @@ func (b *BusinessCommands) SetupBusiness(args []string) error {
 func (b *BusinessCommands) ShowBusinessInfo() error {
 	var business models.BusinessInfo
 	err := b.db.QueryRow(`
-		SELECT id, business_name, contact_name, email, phone, address, city, state, zip_code, country, tax_id, website, logo_path, invoice_prefix, updated_at
-		FROM business_info WHERE id = 1
-	`).Scan(&business.ID, &business.BusinessName, &business.ContactName, &business.Email,
+		SELECT user_id, business_name, contact_name, email, phone, address, city, state, zip_code, country, tax_id, website, logo_path, invoice_prefix, updated_at
+		FROM business_info WHERE user_id = ?
+	`, database.DefaultUserID).Scan(&business.ID, &business.BusinessName, &business.ContactName, &business.Email,
 		&business.Phone, &business.Address, &business.City, &business.State,
 		&business.ZipCode, &business.Country, &business.TaxID, &business.Website,
 		&business.LogoPath, &business.InvoicePrefix, &business.UpdatedAt)

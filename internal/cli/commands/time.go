@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/austin/hours-mcp/internal/cli/output"
+	"github.com/austin/hours-mcp/internal/database"
 	"github.com/austin/hours-mcp/internal/models"
 	"github.com/austin/hours-mcp/internal/timeparse"
 	"github.com/google/uuid"
@@ -80,9 +81,9 @@ func (t *TimeCommands) AddTime(args []string) error {
 	entryID := uuid.New().String()
 
 	_, err = t.db.Exec(`
-		INSERT INTO time_entries (id, client_id, contract_id, date, hours, description, contract_ref)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, entryID, clientID, contractID, entryDate.Format("2006-01-02"), hours, description, contractNumber)
+		INSERT INTO time_entries (id, user_id, client_id, contract_id, date, hours, description, contract_ref)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, entryID, database.DefaultUserID, clientID, contractID, entryDate.Format("2006-01-02"), hours, description, contractNumber)
 
 	if err != nil {
 		return fmt.Errorf("failed to add hours: %w", err)
@@ -188,10 +189,12 @@ func (t *TimeCommands) ListTime(args []string) error {
 	return nil
 }
 
-// getClientIDByName is a helper method to get client ID by name
+// getClientIDByName is a helper method to get client ID by name (scoped to
+// the local DefaultUserID — the CLI is single-user only).
 func (t *TimeCommands) getClientIDByName(name string) (int, error) {
 	var id int
-	err := t.db.QueryRow("SELECT id FROM clients WHERE name = ?", name).Scan(&id)
+	err := t.db.QueryRow("SELECT id FROM clients WHERE user_id = ? AND name = ?",
+		database.DefaultUserID, name).Scan(&id)
 	if err == sql.ErrNoRows {
 		return 0, fmt.Errorf("client '%s' not found", name)
 	}

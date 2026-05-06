@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { RouterLink } from 'vue-router'
-import { api, formatCurrency } from '../api'
+import { api, downloadQuoteFile, formatCurrency } from '../api'
 import type { Client, Quote } from '../types'
 import PageHeader from '../components/PageHeader.vue'
 import Modal from '../components/Modal.vue'
@@ -9,7 +9,6 @@ import LoadingBar from '../components/LoadingBar.vue'
 import EmptyState from '../components/EmptyState.vue'
 import StatusChip from '../components/StatusChip.vue'
 import { useConfirm } from '../composables/useConfirm'
-import { isWails, revealInFinder } from '../wailsShim'
 
 const { confirm: confirmDialog, alert: alertDialog } = useConfirm()
 
@@ -25,7 +24,6 @@ const modalOpen = ref(false)
 const creating = ref(false)
 const createError = ref<string | null>(null)
 const downloadingNumber = ref<string | null>(null)
-const nativeReveal = isWails()
 
 type LineItemDraft = {
   description: string
@@ -152,9 +150,9 @@ async function downloadQuote(q: Quote) {
   if (downloadingNumber.value) return
   downloadingNumber.value = q.quote_number
   try {
-    const res = await api.downloadQuote(q.quote_number)
-    if (nativeReveal) await revealInFinder(res.pdf_path)
-    await load()
+    // Web mode: triggers an anchor click → browser handles the download.
+    // Wails mode: pops a native Save-As dialog and writes the bytes.
+    await downloadQuoteFile(q.quote_number)
   } catch (e: any) {
     await alertDialog({
       title: 'Could not generate PDF',

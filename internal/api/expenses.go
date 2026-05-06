@@ -29,9 +29,13 @@ type expenseRow struct {
 }
 
 func (h *handlers) listExpenses(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	q := r.URL.Query()
-	clauses := []string{"1=1"}
-	args := []interface{}{}
+	clauses := []string{"e.user_id = ?"}
+	args := []interface{}{userID}
 
 	if v := q.Get("client_id"); v != "" {
 		clauses = append(clauses, "e.client_id = ?")
@@ -101,12 +105,19 @@ type expenseReq struct {
 }
 
 func (h *handlers) addExpense(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	var req expenseReq
 	if err := decodeBody(r, &req); err != nil {
 		return nil, err
 	}
 	if req.ClientID == 0 {
 		return nil, newAPIError(http.StatusBadRequest, "client_id required")
+	}
+	if _, err := h.requireClient(userID, req.ClientID); err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(req.Description) == "" {
 		return nil, newAPIError(http.StatusBadRequest, "description required")
@@ -126,8 +137,8 @@ func (h *handlers) addExpense(w http.ResponseWriter, r *http.Request) (interface
 	contractID := req.ContractID
 	if contractID == nil && req.ContractNumber != "" {
 		var cid int
-		if err := h.db.QueryRow(`SELECT id FROM contracts WHERE contract_number = ? AND client_id = ?`,
-			req.ContractNumber, req.ClientID).Scan(&cid); err == sql.ErrNoRows {
+		if err := h.db.QueryRow(`SELECT id FROM contracts WHERE contract_number = ? AND client_id = ? AND user_id = ?`,
+			req.ContractNumber, req.ClientID, userID).Scan(&cid); err == sql.ErrNoRows {
 			return nil, newAPIError(http.StatusBadRequest, "contract %s not found for client", req.ContractNumber)
 		} else if err != nil {
 			return nil, err
@@ -137,26 +148,30 @@ func (h *handlers) addExpense(w http.ResponseWriter, r *http.Request) (interface
 
 	id := uuid.New().String()
 	_, err = h.db.Exec(`
-		INSERT INTO expenses (id, client_id, contract_id, date, description, amount, currency, category, receipt_path)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, id, req.ClientID, contractID, date.Format("2006-01-02"), req.Description, req.Amount,
+		INSERT INTO expenses (id, user_id, client_id, contract_id, date, description, amount, currency, category, receipt_path)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, id, userID, req.ClientID, contractID, date.Format("2006-01-02"), req.Description, req.Amount,
 		req.Currency, nullStr(req.Category), nullStr(req.ReceiptPath))
 	if err != nil {
 		return nil, err
 	}
 
-	BroadcastEvent("expense.created", map[string]any{"id": id, "client_id": req.ClientID})
+	BroadcastUserEvent(userID, "expense.created", map[string]any{"id": id, "client_id": req.ClientID})
 	return map[string]interface{}{"id": id}, nil
 }
 
 func (h *handlers) updateExpense(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	id := r.PathValue("id")
 	if id == "" {
 		return nil, newAPIError(http.StatusBadRequest, "id required")
 	}
 
 	var invoiceID sql.NullInt64
-	if err := h.db.QueryRow(`SELECT invoice_id FROM expenses WHERE id = ?`, id).Scan(&invoiceID); err == sql.ErrNoRows {
+	if err := h.db.QueryRow(`SELECT invoice_id FROM expenses WHERE id = ? AND user_id = ?`, id, userID).Scan(&invoiceID); err == sql.ErrNoRows {
 		return nil, newAPIError(http.StatusNotFound, "expense not found")
 	} else if err != nil {
 		return nil, err
@@ -203,23 +218,27 @@ func (h *handlers) updateExpense(w http.ResponseWriter, r *http.Request) (interf
 	if len(sets) == 0 {
 		return nil, newAPIError(http.StatusBadRequest, "no fields to update")
 	}
-	args = append(args, id)
-	if _, err := h.db.Exec(`UPDATE expenses SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...); err != nil {
+	args = append(args, id, userID)
+	if _, err := h.db.Exec(`UPDATE expenses SET `+strings.Join(sets, ", ")+` WHERE id = ? AND user_id = ?`, args...); err != nil {
 		return nil, err
 	}
 
-	BroadcastEvent("expense.updated", map[string]any{"id": id})
+	BroadcastUserEvent(userID, "expense.updated", map[string]any{"id": id})
 	return map[string]interface{}{"id": id}, nil
 }
 
 func (h *handlers) deleteExpense(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	id := r.PathValue("id")
 	if id == "" {
 		return nil, newAPIError(http.StatusBadRequest, "id required")
 	}
 
 	var invoiceID sql.NullInt64
-	if err := h.db.QueryRow(`SELECT invoice_id FROM expenses WHERE id = ?`, id).Scan(&invoiceID); err == sql.ErrNoRows {
+	if err := h.db.QueryRow(`SELECT invoice_id FROM expenses WHERE id = ? AND user_id = ?`, id, userID).Scan(&invoiceID); err == sql.ErrNoRows {
 		return nil, newAPIError(http.StatusNotFound, "expense not found")
 	} else if err != nil {
 		return nil, err
@@ -228,11 +247,11 @@ func (h *handlers) deleteExpense(w http.ResponseWriter, r *http.Request) (interf
 		return nil, newAPIError(http.StatusConflict, "cannot delete invoiced expense")
 	}
 
-	if _, err := h.db.Exec(`DELETE FROM expenses WHERE id = ?`, id); err != nil {
+	if _, err := h.db.Exec(`DELETE FROM expenses WHERE id = ? AND user_id = ?`, id, userID); err != nil {
 		return nil, err
 	}
 
-	BroadcastEvent("expense.deleted", map[string]any{"id": id})
+	BroadcastUserEvent(userID, "expense.deleted", map[string]any{"id": id})
 	return map[string]interface{}{"deleted": id}, nil
 }
 

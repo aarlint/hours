@@ -9,6 +9,7 @@ import (
 
 	"github.com/austin/hours-mcp/internal/billing"
 	"github.com/austin/hours-mcp/internal/cli/output"
+	"github.com/austin/hours-mcp/internal/database"
 	"github.com/austin/hours-mcp/internal/models"
 )
 
@@ -114,10 +115,10 @@ func (c *ContractCommands) AddContract(args []string) error {
 	// Insert contract
 	var contractID int64
 	err = c.db.QueryRow(`
-		INSERT INTO contracts (client_id, contract_number, name, hourly_rate, currency, contract_type, start_date, end_date, payment_terms, billing_cycle_day, billing_cycle_type, auto_bill_enabled)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO contracts (user_id, client_id, contract_number, name, hourly_rate, currency, contract_type, start_date, end_date, payment_terms, billing_cycle_day, billing_cycle_type, auto_bill_enabled)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		RETURNING id
-	`, clientID, contractNumber, name, hourlyRate, currency, contractType, startDate.Format("2006-01-02"),
+	`, database.DefaultUserID, clientID, contractNumber, name, hourlyRate, currency, contractType, startDate.Format("2006-01-02"),
 		func() interface{} {
 			if endDate != nil {
 				return endDate.Format("2006-01-02")
@@ -435,10 +436,12 @@ func (c *ContractCommands) EditContract(args []string) error {
 	return nil
 }
 
-// getClientIDByName is a helper method to get client ID by name
+// getClientIDByName is a helper method to get client ID by name (scoped to
+// the local DefaultUserID — the CLI is single-user only).
 func (c *ContractCommands) getClientIDByName(name string) (int, error) {
 	var id int
-	err := c.db.QueryRow("SELECT id FROM clients WHERE name = ?", name).Scan(&id)
+	err := c.db.QueryRow("SELECT id FROM clients WHERE user_id = ? AND name = ?",
+		database.DefaultUserID, name).Scan(&id)
 	if err == sql.ErrNoRows {
 		return 0, fmt.Errorf("client '%s' not found", name)
 	}

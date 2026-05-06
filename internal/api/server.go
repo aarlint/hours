@@ -11,13 +11,32 @@ import (
 	"time"
 
 	"github.com/austin/hours-mcp/internal/auth"
+	"github.com/austin/hours-mcp/internal/database"
 )
 
 type Server struct {
 	db     *sql.DB
 	mux    *http.ServeMux
+	apiMux *http.ServeMux
 	assets fs.FS
 	auth   *auth.Auth
+}
+
+// AttachMCPHandler registers an http.Handler to serve the remote MCP endpoint
+// at /api/mcp (and /api/mcp/...). It must be called BEFORE ListenAndServe
+// returns; in practice, call it immediately after NewServerWithAuth.
+//
+// /api/mcp inherits the JSON 401 behaviour of the auth middleware (rather
+// than the browser redirect used for SPA paths) because mcp-remote / Claude
+// Desktop expect that response shape.
+//
+// We expose this as a setter rather than wiring the MCP server inline so the
+// api package stays free of the internal/server (tool registration) package
+// — internal/server already imports internal/api for shared helpers, so a
+// reverse dependency would create a cycle.
+func (s *Server) AttachMCPHandler(h http.Handler) {
+	s.apiMux.Handle("/api/mcp", h)
+	s.apiMux.Handle("/api/mcp/", h)
 }
 
 func NewServer(db *sql.DB, assets fs.FS) *Server {
@@ -65,6 +84,7 @@ func (s *Server) registerRoutes() {
 
 	// API mux — wrapped with auth middleware below if enabled.
 	apiMux := http.NewServeMux()
+	s.apiMux = apiMux
 
 	if s.auth.Enabled() {
 		apiMux.HandleFunc("GET /api/me", s.auth.MeHandler)
@@ -76,92 +96,129 @@ func (s *Server) registerRoutes() {
 		})
 	}
 
+	// scoped binds an http.Handler under a single scope check. When auth is
+	// disabled (Wails / single-user) RequireScope is a no-op, so callers see
+	// the same shape on both paths.
+	scoped := func(scope auth.Scope, h http.Handler) http.Handler {
+		return s.auth.RequireScope(scope)(h)
+	}
+	scopedFn := func(scope auth.Scope, fn http.HandlerFunc) http.Handler {
+		return scoped(scope, fn)
+	}
+
 	// Dashboard
-	apiMux.HandleFunc("GET /api/stats", jsonHandler(h.getStats))
+	apiMux.Handle("GET /api/stats", scopedFn(auth.ScopeStatsRead, jsonHandler(h.getStats)))
 
 	// Server-Sent Events stream
-	apiMux.HandleFunc("GET /api/events", s.handleEvents)
+	apiMux.Handle("GET /api/events", scopedFn(auth.ScopeEventsRead, http.HandlerFunc(s.handleEvents)))
 	InitEventBus(s.db)
 
 	// Business info
-	apiMux.HandleFunc("GET /api/business-info", jsonHandler(h.getBusinessInfo))
-	apiMux.HandleFunc("PUT /api/business-info", jsonHandler(h.setBusinessInfo))
+	apiMux.Handle("GET /api/business-info", scopedFn(auth.ScopeBusinessInfoRead, jsonHandler(h.getBusinessInfo)))
+	apiMux.Handle("PUT /api/business-info", scopedFn(auth.ScopeBusinessInfoWrite, jsonHandler(h.setBusinessInfo)))
 
 	// Clients
-	apiMux.HandleFunc("GET /api/clients", jsonHandler(h.listClients))
-	apiMux.HandleFunc("POST /api/clients", jsonHandler(h.addClient))
-	apiMux.HandleFunc("PUT /api/clients/{id}", jsonHandler(h.editClient))
-	apiMux.HandleFunc("DELETE /api/clients/{id}", jsonHandler(h.deleteClient))
+	apiMux.Handle("GET /api/clients", scopedFn(auth.ScopeClientsRead, jsonHandler(h.listClients)))
+	apiMux.Handle("POST /api/clients", scopedFn(auth.ScopeClientsWrite, jsonHandler(h.addClient)))
+	apiMux.Handle("PUT /api/clients/{id}", scopedFn(auth.ScopeClientsWrite, jsonHandler(h.editClient)))
+	apiMux.Handle("DELETE /api/clients/{id}", scopedFn(auth.ScopeClientsWrite, jsonHandler(h.deleteClient)))
 
 	// Recipients
-	apiMux.HandleFunc("GET /api/clients/{id}/recipients", jsonHandler(h.listRecipients))
-	apiMux.HandleFunc("POST /api/clients/{id}/recipients", jsonHandler(h.addRecipient))
-	apiMux.HandleFunc("DELETE /api/recipients/{id}", jsonHandler(h.removeRecipient))
+	apiMux.Handle("GET /api/clients/{id}/recipients", scopedFn(auth.ScopeRecipientsRead, jsonHandler(h.listRecipients)))
+	apiMux.Handle("POST /api/clients/{id}/recipients", scopedFn(auth.ScopeRecipientsWrite, jsonHandler(h.addRecipient)))
+	apiMux.Handle("DELETE /api/recipients/{id}", scopedFn(auth.ScopeRecipientsWrite, jsonHandler(h.removeRecipient)))
 
 	// Payment details (legacy per-client — kept for backward-compat;
 	// new UI uses business-level /api/payment-methods below).
-	apiMux.HandleFunc("GET /api/clients/{id}/payment-details", jsonHandler(h.getPaymentDetails))
-	apiMux.HandleFunc("PUT /api/clients/{id}/payment-details", jsonHandler(h.setPaymentDetails))
+	apiMux.Handle("GET /api/clients/{id}/payment-details", scopedFn(auth.ScopePaymentMethodsRead, jsonHandler(h.getPaymentDetails)))
+	apiMux.Handle("PUT /api/clients/{id}/payment-details", scopedFn(auth.ScopePaymentMethodsWrite, jsonHandler(h.setPaymentDetails)))
 
 	// Payment methods (business-level — attached to contracts)
-	apiMux.HandleFunc("GET /api/payment-methods", jsonHandler(h.listPaymentMethods))
-	apiMux.HandleFunc("POST /api/payment-methods", jsonHandler(h.addPaymentMethod))
-	apiMux.HandleFunc("PUT /api/payment-methods/{id}", jsonHandler(h.updatePaymentMethod))
-	apiMux.HandleFunc("DELETE /api/payment-methods/{id}", jsonHandler(h.deletePaymentMethod))
+	apiMux.Handle("GET /api/payment-methods", scopedFn(auth.ScopePaymentMethodsRead, jsonHandler(h.listPaymentMethods)))
+	apiMux.Handle("POST /api/payment-methods", scopedFn(auth.ScopePaymentMethodsWrite, jsonHandler(h.addPaymentMethod)))
+	apiMux.Handle("PUT /api/payment-methods/{id}", scopedFn(auth.ScopePaymentMethodsWrite, jsonHandler(h.updatePaymentMethod)))
+	apiMux.Handle("DELETE /api/payment-methods/{id}", scopedFn(auth.ScopePaymentMethodsWrite, jsonHandler(h.deletePaymentMethod)))
 
 	// Contracts
-	apiMux.HandleFunc("GET /api/contracts", jsonHandler(h.listContracts))
-	apiMux.HandleFunc("POST /api/contracts", jsonHandler(h.addContract))
-	apiMux.HandleFunc("PUT /api/contracts/{id}", jsonHandler(h.editContract))
+	apiMux.Handle("GET /api/contracts", scopedFn(auth.ScopeContractsRead, jsonHandler(h.listContracts)))
+	apiMux.Handle("POST /api/contracts", scopedFn(auth.ScopeContractsWrite, jsonHandler(h.addContract)))
+	apiMux.Handle("PUT /api/contracts/{id}", scopedFn(auth.ScopeContractsWrite, jsonHandler(h.editContract)))
 
 	// Time entries
-	apiMux.HandleFunc("GET /api/time-entries", jsonHandler(h.searchTimeEntries))
-	apiMux.HandleFunc("POST /api/time-entries", jsonHandler(h.addTimeEntry))
-	apiMux.HandleFunc("POST /api/time-entries/bulk", jsonHandler(h.bulkAddTimeEntries))
-	apiMux.HandleFunc("POST /api/time-entries/bulk-delete", jsonHandler(h.bulkDeleteTimeEntries))
-	apiMux.HandleFunc("POST /api/time-entries/mark-invoiced", jsonHandler(h.markTimeEntriesInvoiced))
-	apiMux.HandleFunc("POST /api/time-entries/unmark", jsonHandler(h.unmarkTimeEntries))
-	apiMux.HandleFunc("PUT /api/time-entries/{id}", jsonHandler(h.updateTimeEntry))
-	apiMux.HandleFunc("DELETE /api/time-entries/{id}", jsonHandler(h.deleteTimeEntry))
+	apiMux.Handle("GET /api/time-entries", scopedFn(auth.ScopeTimeEntriesRead, jsonHandler(h.searchTimeEntries)))
+	apiMux.Handle("POST /api/time-entries", scopedFn(auth.ScopeTimeEntriesWrite, jsonHandler(h.addTimeEntry)))
+	apiMux.Handle("POST /api/time-entries/bulk", scopedFn(auth.ScopeTimeEntriesWrite, jsonHandler(h.bulkAddTimeEntries)))
+	apiMux.Handle("POST /api/time-entries/bulk-delete", scopedFn(auth.ScopeTimeEntriesWrite, jsonHandler(h.bulkDeleteTimeEntries)))
+	apiMux.Handle("POST /api/time-entries/mark-invoiced", scopedFn(auth.ScopeTimeEntriesWrite, jsonHandler(h.markTimeEntriesInvoiced)))
+	apiMux.Handle("POST /api/time-entries/unmark", scopedFn(auth.ScopeTimeEntriesWrite, jsonHandler(h.unmarkTimeEntries)))
+	apiMux.Handle("PUT /api/time-entries/{id}", scopedFn(auth.ScopeTimeEntriesWrite, jsonHandler(h.updateTimeEntry)))
+	apiMux.Handle("DELETE /api/time-entries/{id}", scopedFn(auth.ScopeTimeEntriesWrite, jsonHandler(h.deleteTimeEntry)))
 
 	// Invoices
-	apiMux.HandleFunc("GET /api/invoices", jsonHandler(h.listInvoices))
-	apiMux.HandleFunc("POST /api/invoices", jsonHandler(h.createInvoice))
-	apiMux.HandleFunc("GET /api/invoices/{number}", jsonHandler(h.getInvoiceDetails))
-	apiMux.HandleFunc("GET /api/invoices/{number}/preview", jsonHandler(h.getInvoicePreview))
-	apiMux.HandleFunc("PATCH /api/invoices/{number}", jsonHandler(h.updateInvoiceStatus))
-	apiMux.HandleFunc("DELETE /api/invoices/{number}", jsonHandler(h.deleteInvoice))
-	apiMux.HandleFunc("POST /api/invoices/{number}/download", jsonHandler(h.downloadInvoice))
+	apiMux.Handle("GET /api/invoices", scopedFn(auth.ScopeInvoicesRead, jsonHandler(h.listInvoices)))
+	apiMux.Handle("POST /api/invoices", scopedFn(auth.ScopeInvoicesWrite, jsonHandler(h.createInvoice)))
+	apiMux.Handle("GET /api/invoices/{number}", scopedFn(auth.ScopeInvoicesRead, jsonHandler(h.getInvoiceDetails)))
+	apiMux.Handle("GET /api/invoices/{number}/preview", scopedFn(auth.ScopeInvoicesRead, jsonHandler(h.getInvoicePreview)))
+	apiMux.Handle("PATCH /api/invoices/{number}", scopedFn(auth.ScopeInvoicesWrite, jsonHandler(h.updateInvoiceStatus)))
+	apiMux.Handle("DELETE /api/invoices/{number}", scopedFn(auth.ScopeInvoicesWrite, jsonHandler(h.deleteInvoice)))
+	apiMux.Handle("POST /api/invoices/{number}/download", scopedFn(auth.ScopeInvoicesRead, http.HandlerFunc(h.downloadInvoice)))
 
 	// Expenses
-	apiMux.HandleFunc("GET /api/expenses", jsonHandler(h.listExpenses))
-	apiMux.HandleFunc("POST /api/expenses", jsonHandler(h.addExpense))
-	apiMux.HandleFunc("PUT /api/expenses/{id}", jsonHandler(h.updateExpense))
-	apiMux.HandleFunc("DELETE /api/expenses/{id}", jsonHandler(h.deleteExpense))
+	apiMux.Handle("GET /api/expenses", scopedFn(auth.ScopeExpensesRead, jsonHandler(h.listExpenses)))
+	apiMux.Handle("POST /api/expenses", scopedFn(auth.ScopeExpensesWrite, jsonHandler(h.addExpense)))
+	apiMux.Handle("PUT /api/expenses/{id}", scopedFn(auth.ScopeExpensesWrite, jsonHandler(h.updateExpense)))
+	apiMux.Handle("DELETE /api/expenses/{id}", scopedFn(auth.ScopeExpensesWrite, jsonHandler(h.deleteExpense)))
 
 	// Quotes
-	apiMux.HandleFunc("GET /api/quotes", jsonHandler(h.listQuotes))
-	apiMux.HandleFunc("POST /api/quotes", jsonHandler(h.createQuote))
-	apiMux.HandleFunc("GET /api/quotes/{number}", jsonHandler(h.getQuoteDetails))
-	apiMux.HandleFunc("PUT /api/quotes/{number}", jsonHandler(h.updateQuote))
-	apiMux.HandleFunc("PATCH /api/quotes/{number}", jsonHandler(h.updateQuoteStatus))
-	apiMux.HandleFunc("DELETE /api/quotes/{number}", jsonHandler(h.deleteQuote))
-	apiMux.HandleFunc("POST /api/quotes/{number}/download", jsonHandler(h.downloadQuote))
-	apiMux.HandleFunc("POST /api/quotes/{number}/convert", jsonHandler(h.convertQuote))
+	apiMux.Handle("GET /api/quotes", scopedFn(auth.ScopeQuotesRead, jsonHandler(h.listQuotes)))
+	apiMux.Handle("POST /api/quotes", scopedFn(auth.ScopeQuotesWrite, jsonHandler(h.createQuote)))
+	apiMux.Handle("GET /api/quotes/{number}", scopedFn(auth.ScopeQuotesRead, jsonHandler(h.getQuoteDetails)))
+	apiMux.Handle("PUT /api/quotes/{number}", scopedFn(auth.ScopeQuotesWrite, jsonHandler(h.updateQuote)))
+	apiMux.Handle("PATCH /api/quotes/{number}", scopedFn(auth.ScopeQuotesWrite, jsonHandler(h.updateQuoteStatus)))
+	apiMux.Handle("DELETE /api/quotes/{number}", scopedFn(auth.ScopeQuotesWrite, jsonHandler(h.deleteQuote)))
+	apiMux.Handle("POST /api/quotes/{number}/download", scopedFn(auth.ScopeQuotesRead, http.HandlerFunc(h.downloadQuote)))
+	// Convert needs both quote-write (mutates quote.status / converted_id) and
+	// contract-write (creates a contract row). Chain RequireScope twice.
+	apiMux.Handle("POST /api/quotes/{number}/convert",
+		s.auth.RequireScope(auth.ScopeQuotesWrite)(
+			s.auth.RequireScope(auth.ScopeContractsWrite)(jsonHandler(h.convertQuote)),
+		),
+	)
 
 	// Data portability — JSON export of every business-level table, and
 	// a destructive import that wipes the existing rows first. Import is
 	// admin-only when auth is enabled (see below).
-	apiMux.HandleFunc("GET /api/export", h.exportData)
-	apiMux.Handle("POST /api/import", s.adminOnly(http.HandlerFunc(h.importData)))
+	apiMux.Handle("GET /api/export", scopedFn(auth.ScopeDataExport, http.HandlerFunc(h.exportData)))
+	apiMux.Handle("POST /api/import",
+		s.auth.RequireScope(auth.ScopeDataImport)(s.adminOnly(http.HandlerFunc(h.importData))),
+	)
+
+	// API tokens (session-only — bearer-authenticated requests cannot mint
+	// or revoke other tokens). RequireSession returns 403 for token callers.
+	apiMux.Handle("GET /api/tokens", s.auth.RequireSession()(jsonHandler(h.listAPITokens)))
+	apiMux.Handle("POST /api/tokens", s.auth.RequireSession()(jsonHandler(h.createAPIToken)))
+	apiMux.Handle("DELETE /api/tokens/{id}", s.auth.RequireSession()(jsonHandler(h.revokeAPIToken)))
+
+	// Token usage metrics — also session-only so a leaked token cannot
+	// inspect its own (or any) usage history.
+	apiMux.Handle("GET /api/tokens/{id}/usage", s.auth.RequireSession()(jsonHandler(h.getAPITokenUsage)))
+	apiMux.Handle("GET /api/tokens/{id}/usage/recent", s.auth.RequireSession()(jsonHandler(h.getAPITokenUsageRecent)))
 
 	// Mount the API mux. When auth is enabled, every /api/* path goes
 	// through the auth middleware. /api/me handles the unauth case itself
 	// (it returns 401), so we exclude it from the redirect path.
+	//
+	// UsageRecorder is the inner wrapper: Middleware populates the user-in-
+	// context, then UsageRecorder runs `next` and records to api_token_usage
+	// on the way out (no-op for non-token traffic).
 	if s.auth.Enabled() {
-		s.mux.Handle("/api/", s.auth.Middleware(apiMux))
+		s.mux.Handle("/api/", s.auth.Middleware(s.auth.UsageRecorder(apiMux)))
 	} else {
-		s.mux.Handle("/api/", apiMux)
+		// Wails/local single-user mode: synthesise a DefaultUserID context
+		// so every handler downstream sees a user without us having to
+		// special-case the unauth path. The Wails desktop app is the only
+		// caller of this branch; serve mode now requires OIDC up front.
+		s.mux.Handle("/api/", localUserMiddleware(apiMux))
 	}
 
 	// Static frontend (SPA fallback). Auth-gated when enabled, but the
@@ -174,6 +231,17 @@ func (s *Server) registerRoutes() {
 			s.mux.HandleFunc("/", s.serveSPA)
 		}
 	}
+}
+
+// localUserMiddleware injects a synthetic User into the request context for
+// the auth-disabled (Wails) path. Without it, currentUserID would return 401
+// in the embedded server. Authenticated multi-tenant traffic never goes
+// through here — it's gated by auth.Middleware instead.
+func localUserMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := auth.WithLocalUser(r.Context(), database.DefaultUserID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 // adminOnly wraps next in the auth.RequireRole("admin") guard when auth is

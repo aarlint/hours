@@ -2,6 +2,7 @@ package pdf
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/austin/hours-mcp/internal/models"
 	"github.com/johnfercher/maroto/v2"
@@ -19,7 +20,10 @@ func NewQuoteGenerator() *QuoteGenerator {
 	return &QuoteGenerator{}
 }
 
-func (g *QuoteGenerator) Generate(quote models.Quote, recipients []models.Recipient, business models.BusinessInfo, outputPath string) error {
+// GenerateBytes builds the quote PDF in memory and returns the encoded bytes,
+// so HTTP handlers can stream it directly without writing to the server's
+// filesystem.
+func (g *QuoteGenerator) GenerateBytes(quote models.Quote, recipients []models.Recipient, business models.BusinessInfo) ([]byte, error) {
 	m := maroto.New(config.NewBuilder().Build())
 
 	// Header: business name + QUOTE
@@ -224,9 +228,19 @@ func (g *QuoteGenerator) Generate(quote models.Quote, recipients []models.Recipi
 
 	document, err := m.Generate()
 	if err != nil {
-		return fmt.Errorf("failed to generate quote PDF: %w", err)
+		return nil, fmt.Errorf("failed to generate quote PDF: %w", err)
 	}
-	if err := document.Save(outputPath); err != nil {
+	return document.GetBytes(), nil
+}
+
+// Generate builds the PDF and saves it to outputPath. Retained so CLI/MCP
+// callers that want the file on the local filesystem keep working.
+func (g *QuoteGenerator) Generate(quote models.Quote, recipients []models.Recipient, business models.BusinessInfo, outputPath string) error {
+	bytes, err := g.GenerateBytes(quote, recipients, business)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(outputPath, bytes, 0o644); err != nil {
 		return fmt.Errorf("failed to save quote PDF: %w", err)
 	}
 	return nil

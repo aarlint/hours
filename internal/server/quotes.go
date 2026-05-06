@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/austin/hours-mcp/internal/auth"
 	"github.com/austin/hours-mcp/internal/models"
 	"github.com/austin/hours-mcp/internal/pdf"
 	"github.com/austin/hours-mcp/internal/timeparse"
@@ -42,7 +43,11 @@ func RegisterQuoteTools(server *mcp.Server, db *sql.DB, h *Handler) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "add_quote",
 		Description: "Create a new draft quote for a client with one or more line items",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args addQuoteArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args addQuoteArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "add_quote", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeQuotesWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		if strings.TrimSpace(args.Title) == "" {
 			return nil, nil, fmt.Errorf("title required")
 		}
@@ -50,7 +55,7 @@ func RegisterQuoteTools(server *mcp.Server, db *sql.DB, h *Handler) {
 			return nil, nil, fmt.Errorf("at least one line item required")
 		}
 
-		clientID, err := h.getClientIDByName(args.ClientName)
+		clientID, err := h.getClientIDByName(userIDFromCtx(ctx), args.ClientName)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -104,10 +109,10 @@ func RegisterQuoteTools(server *mcp.Server, db *sql.DB, h *Handler) {
 		defer tx.Rollback()
 
 		res, err := tx.Exec(`
-			INSERT INTO quotes (client_id, quote_number, title, issue_date, valid_until,
+			INSERT INTO quotes (user_id, client_id, quote_number, title, issue_date, valid_until,
 			                   subtotal, total_amount, currency, status, notes)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)
-		`, clientID, quoteNumber, args.Title,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)
+		`, userIDFromCtx(ctx), clientID, quoteNumber, args.Title,
 			issue.Format("2006-01-02"), validUntil.Format("2006-01-02"),
 			subtotal, subtotal, currency, args.Notes)
 		if err != nil {
@@ -155,7 +160,11 @@ func RegisterQuoteTools(server *mcp.Server, db *sql.DB, h *Handler) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_quotes",
 		Description: "List quotes with optional filters",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args listQuotesArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args listQuotesArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "list_quotes", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeQuotesRead); err != nil {
+			return scopeError(err), nil, nil
+		}
 		q := `
 			SELECT q.quote_number, q.title, c.name, q.issue_date, q.valid_until,
 			       q.total_amount, q.currency, q.status
@@ -165,7 +174,7 @@ func RegisterQuoteTools(server *mcp.Server, db *sql.DB, h *Handler) {
 		`
 		queryArgs := []interface{}{}
 		if args.ClientName != "" {
-			clientID, err := h.getClientIDByName(args.ClientName)
+			clientID, err := h.getClientIDByName(userIDFromCtx(ctx), args.ClientName)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -230,7 +239,11 @@ func RegisterQuoteTools(server *mcp.Server, db *sql.DB, h *Handler) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "get_quote",
 		Description: "Get full details of a quote including line items",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args getQuoteArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args getQuoteArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "get_quote", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeQuotesRead); err != nil {
+			return scopeError(err), nil, nil
+		}
 		var (
 			id         int
 			clientName string
@@ -315,7 +328,11 @@ func RegisterQuoteTools(server *mcp.Server, db *sql.DB, h *Handler) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "update_quote_status",
 		Description: "Update a quote's status (sent, accepted, rejected, expired)",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args updateQuoteStatusArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args updateQuoteStatusArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "update_quote_status", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeQuotesWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		valid := map[string]bool{"draft": true, "sent": true, "accepted": true, "rejected": true, "expired": true}
 		if !valid[args.Status] {
 			return nil, nil, fmt.Errorf("invalid status (allowed: draft, sent, accepted, rejected, expired)")
@@ -349,7 +366,11 @@ func RegisterQuoteTools(server *mcp.Server, db *sql.DB, h *Handler) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "convert_quote_to_contract",
 		Description: "Convert an accepted quote into an active contract. The contract's hourly rate is derived from the quote's line items (weighted average of hour-based items, or the first line's unit price).",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args convertQuoteArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args convertQuoteArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "convert_quote_to_contract", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeQuotesWrite, auth.ScopeContractsWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		if strings.TrimSpace(args.ContractNumber) == "" {
 			return nil, nil, fmt.Errorf("contract_number required")
 		}
@@ -437,11 +458,11 @@ func RegisterQuoteTools(server *mcp.Server, db *sql.DB, h *Handler) {
 
 		var contractID int64
 		err = tx.QueryRow(`
-			INSERT INTO contracts (client_id, contract_number, name, hourly_rate, currency, contract_type,
+			INSERT INTO contracts (user_id, client_id, contract_number, name, hourly_rate, currency, contract_type,
 			                      start_date, end_date, status, payment_terms, notes)
-			VALUES (?, ?, ?, ?, ?, 'hourly', ?, ?, 'active', ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, 'hourly', ?, ?, 'active', ?, ?)
 			RETURNING id
-		`, clientID, args.ContractNumber, name, rate, currency,
+		`, userIDFromCtx(ctx), clientID, args.ContractNumber, name, rate, currency,
 			start.Format("2006-01-02"), endPtr, args.PaymentTerms,
 			fmt.Sprintf("Derived from quote %s", args.QuoteNumber)).Scan(&contractID)
 		if err != nil {
@@ -478,7 +499,11 @@ func RegisterQuoteTools(server *mcp.Server, db *sql.DB, h *Handler) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "download_quote",
 		Description: "Regenerate and save the PDF for a quote into the configured export directory",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args downloadQuoteArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args downloadQuoteArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "download_quote", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeQuotesRead); err != nil {
+			return scopeError(err), nil, nil
+		}
 		var (
 			id          int
 			clientID    int
@@ -547,12 +572,12 @@ func RegisterQuoteTools(server *mcp.Server, db *sql.DB, h *Handler) {
 
 		var business models.BusinessInfo
 		db.QueryRow(`
-			SELECT id, business_name, contact_name, email, COALESCE(phone,''), COALESCE(address,''),
+			SELECT user_id, business_name, contact_name, email, COALESCE(phone,''), COALESCE(address,''),
 			       COALESCE(city,''), COALESCE(state,''), COALESCE(zip_code,''), COALESCE(country,''),
 			       COALESCE(tax_id,''), COALESCE(website,''), COALESCE(logo_path,''), COALESCE(invoice_prefix,'INV'),
 			       COALESCE(export_path,''), updated_at
-			FROM business_info WHERE id = 1
-		`).Scan(&business.ID, &business.BusinessName, &business.ContactName, &business.Email,
+			FROM business_info WHERE user_id = ?
+		`, userIDFromCtx(ctx)).Scan(&business.ID, &business.BusinessName, &business.ContactName, &business.Email,
 			&business.Phone, &business.Address, &business.City, &business.State,
 			&business.ZipCode, &business.Country, &business.TaxID, &business.Website,
 			&business.LogoPath, &business.InvoicePrefix, &business.ExportPath, &business.UpdatedAt)

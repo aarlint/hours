@@ -1,8 +1,11 @@
 import type {
+  ApiToken,
+  ApiTokenWithSecret,
   AuthState,
   BusinessInfo,
   Client,
   Contract,
+  CreateTokenReq,
   Expense,
   ExpenseInput,
   Invoice,
@@ -17,6 +20,8 @@ import type {
   Recipient,
   Stats,
   TimeEntry,
+  TokenUsageSummary,
+  TokenUsageEvent,
 } from './types'
 import { goApp, isWails } from './wailsShim'
 
@@ -227,11 +232,8 @@ export const api = {
       'DELETE',
       `/api/invoices/${encodeURIComponent(number)}`,
     ),
-  downloadInvoice: (number: string) =>
-    request<{ invoice_number: string; pdf_path: string; export_dir: string }>(
-      'POST',
-      `/api/invoices/${encodeURIComponent(number)}/download`,
-    ),
+  // downloadInvoice was removed — use downloadInvoiceFile() below, which
+  // streams PDF bytes (web: anchor-click; Wails: native Save-As dialog).
 
   // Expenses
   listExpenses: (params?: {
@@ -310,11 +312,8 @@ export const api = {
       'DELETE',
       `/api/quotes/${encodeURIComponent(number)}`,
     ),
-  downloadQuote: (number: string) =>
-    request<{ quote_number: string; pdf_path: string; export_dir: string }>(
-      'POST',
-      `/api/quotes/${encodeURIComponent(number)}/download`,
-    ),
+  // downloadQuote was removed — use downloadQuoteFile() below, which
+  // streams PDF bytes (web: anchor-click; Wails: native Save-As dialog).
   convertQuote: (
     number: string,
     data: {
@@ -336,6 +335,22 @@ export const api = {
   me: () => request<AuthState>('GET', '/api/me'),
   logout: () => request<{ ok: true }>('POST', '/auth/logout'),
 
+  // API tokens — session-only management of personal bearer tokens.
+  // POST returns the raw token exactly once; subsequent GETs only expose
+  // metadata + the visible prefix.
+  listApiTokens: () => request<ApiToken[]>('GET', '/api/tokens'),
+  createApiToken: (body: CreateTokenReq) =>
+    request<ApiTokenWithSecret>('POST', '/api/tokens', body),
+  revokeApiToken: (id: number) =>
+    request<{ deleted: number }>('DELETE', `/api/tokens/${id}`),
+
+  // Per-token usage metrics. Both endpoints are session-only; bearer tokens
+  // can't probe their own (or anyone else's) usage history.
+  getApiTokenUsage: (id: number) =>
+    request<TokenUsageSummary>('GET', `/api/tokens/${id}/usage`),
+  getApiTokenUsageRecent: (id: number) =>
+    request<TokenUsageEvent[]>('GET', `/api/tokens/${id}/usage/recent`),
+
   // Data export/import — exportData returns the parsed JSON object so the
   // caller can either offer it as a download or post it back to /api/import.
   exportData: () => request<unknown>('GET', '/api/export'),
@@ -345,6 +360,97 @@ export const api = {
       '/api/import',
       payload,
     ),
+}
+
+// ---------- PDF download helpers ----------
+//
+// In the web (--serve) deployment we hit the streaming endpoint with fetch,
+// turn the response into a Blob, and trigger an anchor click so the browser
+// runs its standard "save / open" UI.
+//
+// In the Wails desktop app we delegate to a per-document Go binding
+// (SaveInvoicePDF / SaveQuotePDF). That dispatches the same HTTP request
+// through the in-process mux and pops a native Save-As dialog — necessary
+// because the Wails transport returns string-only bodies and can't safely
+// carry binary PDF.
+
+function suggestedInvoiceFilename(invoiceNumber: string): string {
+  const today = new Date().toISOString().slice(0, 10)
+  return `invoice_${invoiceNumber}_${today}.pdf`
+}
+
+function suggestedQuoteFilename(quoteNumber: string): string {
+  const today = new Date().toISOString().slice(0, 10)
+  return `quote_${quoteNumber}_${today}.pdf`
+}
+
+function filenameFromContentDisposition(header: string | null, fallback: string): string {
+  if (!header) return fallback
+  const m = header.match(/filename="([^"]+)"/) ?? header.match(/filename=([^;]+)/)
+  return m?.[1]?.trim() || fallback
+}
+
+async function browserDownload(path: string, fallbackFilename: string): Promise<{ filename: string }> {
+  const res = await fetch(path, { method: 'POST', credentials: 'same-origin' })
+  if (!res.ok) {
+    let msg = `${res.status}`
+    try {
+      const data = await res.json()
+      if (data?.error) msg = data.error
+    } catch {}
+    throw new Error(msg)
+  }
+  const blob = await res.blob()
+  const filename = filenameFromContentDisposition(
+    res.headers.get('Content-Disposition'),
+    fallbackFilename,
+  )
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+  return { filename }
+}
+
+export interface DownloadResult {
+  /** Suggested or chosen filename (always set). */
+  filename: string
+  /** Absolute path the user picked in Wails Save-As, null in web mode or if cancelled. */
+  chosenPath: string | null
+}
+
+export async function downloadInvoiceFile(invoiceNumber: string): Promise<DownloadResult> {
+  const filename = suggestedInvoiceFilename(invoiceNumber)
+  if (isWails()) {
+    const app = goApp()
+    if (!app.SaveInvoicePDF) throw new Error('SaveInvoicePDF binding missing — rebuild the desktop app')
+    const chosen = await app.SaveInvoicePDF(invoiceNumber, filename)
+    return { filename, chosenPath: chosen || null }
+  }
+  const { filename: actual } = await browserDownload(
+    `/api/invoices/${encodeURIComponent(invoiceNumber)}/download`,
+    filename,
+  )
+  return { filename: actual, chosenPath: null }
+}
+
+export async function downloadQuoteFile(quoteNumber: string): Promise<DownloadResult> {
+  const filename = suggestedQuoteFilename(quoteNumber)
+  if (isWails()) {
+    const app = goApp()
+    if (!app.SaveQuotePDF) throw new Error('SaveQuotePDF binding missing — rebuild the desktop app')
+    const chosen = await app.SaveQuotePDF(quoteNumber, filename)
+    return { filename, chosenPath: chosen || null }
+  }
+  const { filename: actual } = await browserDownload(
+    `/api/quotes/${encodeURIComponent(quoteNumber)}/download`,
+    filename,
+  )
+  return { filename: actual, chosenPath: null }
 }
 
 export function formatCurrency(amount: number, currency = 'USD'): string {

@@ -3,9 +3,11 @@ package wailsapp
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,9 +48,12 @@ func NewApp(db *sql.DB) *App {
 // context for later runtime calls (EventsEmit) and register ourselves as the
 // external event listener so every DB-derived broadcast is also pushed to the
 // JS side via the Wails event bus.
+//
+// The listener ignores the userID parameter — the Wails GUI is single-user by
+// definition, so every event already belongs to the local user.
 func (a *App) Startup(ctx context.Context) {
 	a.ctx = ctx
-	api.SetEventListener(func(kind string, data map[string]any) {
+	api.SetEventListener(func(_ int64, kind string, data map[string]any) {
 		wailsruntime.EventsEmit(ctx, kind, data)
 	})
 	// Emit an initial "hello" so the frontend knows the transport is live.
@@ -128,6 +133,69 @@ func (a *App) SaveTextFile(suggestedName, content string) (string, error) {
 		return "", err
 	}
 	return path, nil
+}
+
+// savePDFThroughDialog dispatches a POST through the in-process HTTP mux,
+// reads the resulting PDF bytes, then prompts the user with a native
+// Save-As dialog and writes the bytes to the chosen path. Used by
+// SaveInvoicePDF and SaveQuotePDF.
+//
+// Returns the absolute path the user picked, or "" if they cancelled.
+// We surface upstream HTTP errors as Go errors so the JS layer can show them.
+func (a *App) savePDFThroughDialog(apiPath, suggestedFilename string) (string, error) {
+	req := httptest.NewRequest(http.MethodPost, apiPath, nil)
+	rr := httptest.NewRecorder()
+	a.handler.ServeHTTP(rr, req)
+	if rr.Code < 200 || rr.Code >= 300 {
+		// The handler emits JSON {"error": "..."} on failure. Surface that
+		// verbatim so the frontend gets the same error shape as the web path.
+		body := strings.TrimSpace(rr.Body.String())
+		if body == "" {
+			body = http.StatusText(rr.Code)
+		}
+		return "", fmt.Errorf("%s", body)
+	}
+
+	chosen, err := wailsruntime.SaveFileDialog(a.ctx, wailsruntime.SaveDialogOptions{
+		Title:           "Save PDF",
+		DefaultFilename: suggestedFilename,
+	})
+	if err != nil {
+		return "", err
+	}
+	if chosen == "" {
+		return "", nil // user cancelled — frontend treats this as a no-op
+	}
+	if err := os.WriteFile(chosen, rr.Body.Bytes(), 0o644); err != nil {
+		return "", fmt.Errorf("write file: %w", err)
+	}
+	return chosen, nil
+}
+
+// SaveInvoicePDF generates the invoice PDF in-process, prompts the user for
+// a destination path via the native Save dialog, and writes the bytes there.
+// Returns the chosen path, or "" if the user cancelled.
+func (a *App) SaveInvoicePDF(invoiceNumber, suggestedFilename string) (string, error) {
+	if invoiceNumber == "" {
+		return "", fmt.Errorf("invoiceNumber required")
+	}
+	if suggestedFilename == "" {
+		suggestedFilename = "invoice.pdf"
+	}
+	apiPath := "/api/invoices/" + url.PathEscape(invoiceNumber) + "/download"
+	return a.savePDFThroughDialog(apiPath, suggestedFilename)
+}
+
+// SaveQuotePDF mirrors SaveInvoicePDF for quotes.
+func (a *App) SaveQuotePDF(quoteNumber, suggestedFilename string) (string, error) {
+	if quoteNumber == "" {
+		return "", fmt.Errorf("quoteNumber required")
+	}
+	if suggestedFilename == "" {
+		suggestedFilename = "quote.pdf"
+	}
+	apiPath := "/api/quotes/" + url.PathEscape(quoteNumber) + "/download"
+	return a.savePDFThroughDialog(apiPath, suggestedFilename)
 }
 
 // RevealInFinder opens the enclosing folder of the given path and selects

@@ -250,6 +250,59 @@ make install
 }
 ```
 
+#### Remote MCP (over HTTPS)
+
+The hosted deployment at `https://hours.arlint.dev` exposes a streamable
+HTTP MCP endpoint at `/api/mcp`. Claude Desktop connects to it through the
+[`mcp-remote`](https://www.npmjs.com/package/mcp-remote) shim, which adds
+the `Authorization` header to every request.
+
+1. **Mint an API token**: open `https://hours.arlint.dev` → Settings → API
+   Tokens. Pick the scopes you need:
+   - For an analyst-style assistant that only reads data, select all
+     `:read` scopes (e.g. `clients:read`, `time_entries:read`,
+     `invoices:read`, `quotes:read`, `expenses:read`,
+     `business_info:read`, `recipients:read`, `contracts:read`,
+     `payment_methods:read`).
+   - For an assistant that should also log time, generate invoices,
+     etc., add the matching `:write` scopes
+     (`time_entries:write`, `invoices:write`, …).
+   - Minting requires a session cookie — bearer tokens cannot mint
+     other tokens.
+2. **Copy the token**: it starts with `ht_` and is shown ONCE at mint
+   time. The server only stores its hash, so a lost token must be
+   revoked and re-minted.
+3. **Add it to Claude Desktop**:
+   ```json
+   {
+     "mcpServers": {
+       "hours-remote": {
+         "command": "npx",
+         "args": [
+           "-y",
+           "mcp-remote",
+           "https://hours.arlint.dev/api/mcp",
+           "--header",
+           "Authorization: Bearer ${HOURS_TOKEN}"
+         ],
+         "env": {
+           "HOURS_TOKEN": "ht_paste-your-token-here"
+         }
+       }
+     }
+   }
+   ```
+4. **Restart Claude Desktop**. The remote server exposes the same tool
+   surface as the local stdio server, with two differences:
+   - Each tool checks the token's scope set; calls without the
+     required scope come back as `permission denied: missing scope(s) …`.
+   - The whole-database backup/restore tools
+     (`create_database_backup`, `restore_database_backup`,
+     `list_database_backups`, `validate_database_backup`) are
+     intentionally NOT registered on the remote transport — they
+     operate on the SQLite file as a unit and cannot be tenant-scoped.
+     Use the local stdio binary for backups.
+
 #### Troubleshooting Configuration
 - Replace `YOUR_USERNAME` with your actual system username
 - Ensure the binary path is correct: `which hours-mcp`

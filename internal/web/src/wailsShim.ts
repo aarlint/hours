@@ -20,6 +20,12 @@ interface GoApp {
   PickDirectory?(title: string): Promise<string>
   RevealInFinder?(path: string): Promise<void>
   SaveTextFile?(suggestedName: string, content: string): Promise<string>
+  // Per-document Save-As bindings. The Wails transport returns string-only
+  // bodies, so we can't safely round-trip binary PDF through Request(). These
+  // dispatch through the in-process mux on the Go side and pop a native Save
+  // dialog before writing the bytes — see internal/wailsapp/app.go.
+  SaveInvoicePDF?(invoiceNumber: string, suggestedFilename: string): Promise<string>
+  SaveQuotePDF?(quoteNumber: string, suggestedFilename: string): Promise<string>
 }
 
 interface WailsRuntime {

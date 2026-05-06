@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
-import { api, formatCurrency, formatHours } from '../api'
+import { api, downloadInvoiceFile, formatCurrency, formatHours } from '../api'
 import type { InvoiceDetails, InvoicePreview as InvoicePreviewData } from '../types'
 import PageHeader from '../components/PageHeader.vue'
 import LoadingBar from '../components/LoadingBar.vue'
@@ -44,10 +44,16 @@ async function downloadPdf() {
   downloading.value = true
   statusMsg.value = ''
   try {
-    const res = await api.downloadInvoice(data.value.invoice.invoice_number)
-    statusMsg.value = 'PDF SAVED'
-    if (nativeReveal) await revealInFinder(res.pdf_path)
-    await load()
+    // Web: anchor-click triggers the browser's standard download handling.
+    // Wails: a native Save-As dialog runs; user-cancellation surfaces as
+    // chosenPath === null, which we treat as a no-op.
+    const res = await downloadInvoiceFile(data.value.invoice.invoice_number)
+    if (res.chosenPath === null && nativeReveal) {
+      // User cancelled the Save dialog; clear status without claiming success.
+      statusMsg.value = ''
+    } else {
+      statusMsg.value = 'PDF SAVED'
+    }
   } catch (e: any) {
     statusMsg.value = 'ERROR: ' + e.message
   } finally {

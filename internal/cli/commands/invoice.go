@@ -10,6 +10,7 @@ import (
 
 	"github.com/austin/hours-mcp/internal/billing"
 	"github.com/austin/hours-mcp/internal/cli/output"
+	"github.com/austin/hours-mcp/internal/database"
 	"github.com/austin/hours-mcp/internal/models"
 	"github.com/austin/hours-mcp/internal/pdf"
 	"github.com/austin/hours-mcp/internal/timeparse"
@@ -56,7 +57,7 @@ func (i *InvoiceCommands) CreateInvoice(args []string) error {
 
 	// Validate business information is configured
 	var businessName string
-	err = i.db.QueryRow("SELECT business_name FROM business_info WHERE id = 1").Scan(&businessName)
+	err = i.db.QueryRow("SELECT business_name FROM business_info WHERE user_id = ?", database.DefaultUserID).Scan(&businessName)
 	if err == sql.ErrNoRows {
 		return fmt.Errorf("business information not configured. Please use 'hours-mcp setup-business' to configure your business details before creating invoices")
 	} else if err != nil {
@@ -150,9 +151,9 @@ func (i *InvoiceCommands) CreateInvoice(args []string) error {
 	defer tx.Rollback()
 
 	result, err := tx.Exec(`
-		INSERT INTO invoices (client_id, invoice_number, issue_date, due_date, total_amount, status)
-		VALUES (?, ?, ?, ?, ?, 'pending')
-	`, clientID, invoiceNumber, issueDate.Format("2006-01-02"), dueDate.Format("2006-01-02"), totalAmount)
+		INSERT INTO invoices (user_id, client_id, invoice_number, issue_date, due_date, total_amount, status)
+		VALUES (?, ?, ?, ?, ?, ?, 'pending')
+	`, database.DefaultUserID, clientID, invoiceNumber, issueDate.Format("2006-01-02"), dueDate.Format("2006-01-02"), totalAmount)
 	if err != nil {
 		return fmt.Errorf("failed to create invoice: %w", err)
 	}
@@ -195,9 +196,9 @@ func (i *InvoiceCommands) CreateInvoice(args []string) error {
 
 	var business models.BusinessInfo
 	i.db.QueryRow(`
-		SELECT id, business_name, contact_name, email, phone, address, city, state, zip_code, country, tax_id, website, logo_path, invoice_prefix, updated_at
-		FROM business_info WHERE id = 1
-	`).Scan(&business.ID, &business.BusinessName, &business.ContactName, &business.Email,
+		SELECT user_id, business_name, contact_name, email, phone, address, city, state, zip_code, country, tax_id, website, logo_path, invoice_prefix, updated_at
+		FROM business_info WHERE user_id = ?
+	`, database.DefaultUserID).Scan(&business.ID, &business.BusinessName, &business.ContactName, &business.Email,
 		&business.Phone, &business.Address, &business.City, &business.State,
 		&business.ZipCode, &business.Country, &business.TaxID, &business.Website,
 		&business.LogoPath, &business.InvoicePrefix, &business.UpdatedAt)
@@ -318,10 +319,12 @@ func (i *InvoiceCommands) ListInvoices(args []string) error {
 	return nil
 }
 
-// getClientIDByName is a helper method to get client ID by name
+// getClientIDByName is a helper method to get client ID by name (scoped to
+// the local DefaultUserID — the CLI is single-user only).
 func (i *InvoiceCommands) getClientIDByName(name string) (int, error) {
 	var id int
-	err := i.db.QueryRow("SELECT id FROM clients WHERE name = ?", name).Scan(&id)
+	err := i.db.QueryRow("SELECT id FROM clients WHERE user_id = ? AND name = ?",
+		database.DefaultUserID, name).Scan(&id)
 	if err == sql.ErrNoRows {
 		return 0, fmt.Errorf("client '%s' not found", name)
 	}
@@ -498,8 +501,8 @@ func (i *InvoiceCommands) GeneratePDF(args []string) error {
 	var business models.BusinessInfo
 	err = i.db.QueryRow(`
 		SELECT business_name, contact_name, email, phone, address, city, state, zip_code, country
-		FROM business_info LIMIT 1
-	`).Scan(&business.BusinessName, &business.ContactName, &business.Email, &business.Phone,
+		FROM business_info WHERE user_id = ?
+	`, database.DefaultUserID).Scan(&business.BusinessName, &business.ContactName, &business.Email, &business.Phone,
 		&business.Address, &business.City, &business.State, &business.ZipCode, &business.Country)
 
 	if err == sql.ErrNoRows {

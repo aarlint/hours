@@ -223,6 +223,79 @@ export interface AuthState {
   role?: 'admin' | 'user' | string
 }
 
+// ---------- API tokens ----------
+
+// Every defined scope in the same order the backend's auth.AllScopes() emits.
+// The UI iterates this list to render the scope-picker checkbox grid in the
+// token-mint modal. Keep in sync with internal/auth/scopes.go.
+export const ALL_SCOPES = [
+  'clients:read', 'clients:write',
+  'contracts:read', 'contracts:write',
+  'time_entries:read', 'time_entries:write',
+  'invoices:read', 'invoices:write',
+  'quotes:read', 'quotes:write',
+  'expenses:read', 'expenses:write',
+  'payment_methods:read', 'payment_methods:write',
+  'business_info:read', 'business_info:write',
+  'recipients:read', 'recipients:write',
+  'stats:read',
+  'events:read',
+  'data:export', 'data:import',
+] as const
+
+export type Scope = (typeof ALL_SCOPES)[number]
+
+// ApiToken is the metadata shape returned by GET /api/tokens — the raw
+// secret is gone forever after the mint response.
+export interface ApiToken {
+  id: number
+  name: string
+  scopes: string[]
+  token_prefix: string
+  expires_at?: string | null
+  last_used_at?: string | null
+  created_at: string
+}
+
+// ApiTokenWithSecret is the one-time mint response. token is the raw bearer
+// the user must copy before dismissing the modal.
+export interface ApiTokenWithSecret extends ApiToken {
+  token: string
+}
+
+export interface CreateTokenReq {
+  name: string
+  scopes: string[]
+  // RFC3339 datetime; null/undefined means no expiry.
+  expires_at?: string | null
+}
+
+// TokenUsageSummary aggregates per-token usage stats — the shape returned by
+// GET /api/tokens/{id}/usage. Matches api.tokenUsageSummaryDTO on the backend.
+export interface TokenUsageSummary {
+  total_calls: number
+  calls_24h: number
+  calls_7d: number
+  calls_30d: number
+  errors_24h: number
+  last_call_at: string | null
+  last_path: string | null
+  last_method: string | null
+  last_status: number | null
+  by_path: { path: string; count: number; errors: number; last_at: string }[]
+}
+
+// TokenUsageEvent is one row from /api/tokens/{id}/usage/recent — newest
+// first, capped at 50 entries by the server.
+export interface TokenUsageEvent {
+  method: string
+  path: string
+  status: number
+  duration_ms: number
+  error: string | null
+  created_at: string
+}
+
 export interface Stats {
   total_clients: number
   active_contracts: number

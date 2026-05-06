@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { RouterLink } from 'vue-router'
-import { api, formatCurrency } from '../api'
+import { api, downloadInvoiceFile, formatCurrency } from '../api'
 import type { Client, Invoice, InvoicePreview as InvoicePreviewData } from '../types'
 import PageHeader from '../components/PageHeader.vue'
 import Modal from '../components/Modal.vue'
@@ -10,7 +10,6 @@ import EmptyState from '../components/EmptyState.vue'
 import StatusChip from '../components/StatusChip.vue'
 import InvoicePreview from '../components/InvoicePreview.vue'
 import { useConfirm } from '../composables/useConfirm'
-import { isWails, revealInFinder } from '../wailsShim'
 
 const { confirm: confirmDialog, alert: alertDialog } = useConfirm()
 
@@ -27,7 +26,6 @@ const creating = ref(false)
 const createError = ref<string | null>(null)
 const createResult = ref<{ invoice_number: string; total_amount: number; pdf_path?: string } | null>(null)
 const downloadingNumber = ref<string | null>(null)
-const nativeReveal = isWails()
 
 const previewOpen = ref(false)
 const previewLoading = ref(false)
@@ -138,9 +136,9 @@ async function downloadInvoice(inv: Invoice) {
   if (downloadingNumber.value) return
   downloadingNumber.value = inv.invoice_number
   try {
-    const res = await api.downloadInvoice(inv.invoice_number)
-    if (nativeReveal) await revealInFinder(res.pdf_path)
-    await load()
+    // Web mode: triggers an anchor click → browser handles the download.
+    // Wails mode: pops a native Save-As dialog and writes the bytes.
+    await downloadInvoiceFile(inv.invoice_number)
   } catch (e: any) {
     await alertDialog({
       title: 'Could not generate PDF',

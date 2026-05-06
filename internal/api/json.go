@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 )
@@ -31,7 +32,12 @@ func jsonHandler(fn func(w http.ResponseWriter, r *http.Request) (interface{}, e
 				writeError(w, apiErr.Status, err)
 				return
 			}
-			writeError(w, http.StatusBadRequest, err)
+			// Untyped errors are bugs (DB failures, scan errors, etc.). Log
+			// the full error for diagnosis and return 500 so the wire status
+			// matches the failure class — clients shouldn't think a malformed
+			// payload caused this.
+			log.Printf("internal handler error: %s %s: %v", r.Method, r.URL.Path, err)
+			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 		if data == nil {

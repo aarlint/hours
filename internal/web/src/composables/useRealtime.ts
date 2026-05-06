@@ -116,12 +116,14 @@ function connectSSE() {
     }
     scheduleReconnect()
   }
-  source.addEventListener('hello', (ev) => {
-    try {
-      const data = JSON.parse((ev as MessageEvent).data)
-      connectionState.lastHeartbeat = Date.now()
-      dispatch({ kind: 'time_entry.created', at: new Date().toISOString(), detail: data })
-    } catch {}
+  // 'hello' is sent by the server once per subscription as a connection
+  // confirmation — it carries no domain payload. We just update the
+  // heartbeat clock so the UI reflects "live" state. Earlier code here
+  // mis-dispatched it as a time_entry.created event, which produced a
+  // phantom toast on every page refresh.
+  source.addEventListener('hello', () => {
+    connectionState.lastHeartbeat = Date.now()
+    connectionState.connected = true
   })
   source.addEventListener('heartbeat', () => {
     connectionState.lastHeartbeat = Date.now()

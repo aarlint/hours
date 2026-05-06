@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
-import { api, formatCurrency } from '../api'
+import { api, downloadQuoteFile, formatCurrency } from '../api'
 import type { QuoteDetails } from '../types'
 import PageHeader from '../components/PageHeader.vue'
 import LoadingBar from '../components/LoadingBar.vue'
@@ -53,10 +53,15 @@ async function downloadPdf() {
   downloading.value = true
   statusMsg.value = ''
   try {
-    const res = await api.downloadQuote(data.value.quote.quote_number)
-    statusMsg.value = 'PDF SAVED'
-    if (nativeReveal) await revealInFinder(res.pdf_path)
-    await load()
+    // Web: anchor-click triggers the browser's standard download handling.
+    // Wails: a native Save-As dialog runs; user-cancellation surfaces as
+    // chosenPath === null, which we treat as a no-op.
+    const res = await downloadQuoteFile(data.value.quote.quote_number)
+    if (res.chosenPath === null && nativeReveal) {
+      statusMsg.value = ''
+    } else {
+      statusMsg.value = 'PDF SAVED'
+    }
   } catch (e: any) {
     statusMsg.value = 'ERROR: ' + e.message
   } finally {

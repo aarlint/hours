@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -95,8 +95,12 @@ const quoteSelect = `
 // ---------- List ----------
 
 func (h *handlers) listQuotes(w http.ResponseWriter, r *http.Request) (interface{}, error) {
-	q := quoteSelect + " WHERE 1=1"
-	args := []interface{}{}
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
+	q := quoteSelect + " WHERE q.user_id = ?"
+	args := []interface{}{userID}
 	qv := r.URL.Query()
 	if v := qv.Get("client_id"); v != "" {
 		q += " AND q.client_id = ?"
@@ -128,8 +132,12 @@ func (h *handlers) listQuotes(w http.ResponseWriter, r *http.Request) (interface
 // ---------- Get ----------
 
 func (h *handlers) getQuoteDetails(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	number := r.PathValue("number")
-	row := h.db.QueryRow(quoteSelect+" WHERE q.quote_number = ?", number)
+	row := h.db.QueryRow(quoteSelect+" WHERE q.quote_number = ? AND q.user_id = ?", number, userID)
 	q, err := scanQuote(row)
 	if err == sql.ErrNoRows {
 		return nil, newAPIError(http.StatusNotFound, "quote not found")
@@ -142,8 +150,9 @@ func (h *handlers) getQuoteDetails(w http.ResponseWriter, r *http.Request) (inte
 		SELECT id, quote_id, description, quantity, unit, unit_price, amount, sort_order
 		FROM quote_line_items
 		WHERE quote_id = ?
+		  AND quote_id IN (SELECT id FROM quotes WHERE user_id = ?)
 		ORDER BY sort_order, id
-	`, q.ID)
+	`, q.ID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -181,12 +190,19 @@ type createQuoteReq struct {
 }
 
 func (h *handlers) createQuote(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	var req createQuoteReq
 	if err := decodeBody(r, &req); err != nil {
 		return nil, err
 	}
 	if req.ClientID == 0 {
 		return nil, newAPIError(http.StatusBadRequest, "client_id required")
+	}
+	if _, err := h.requireClient(userID, req.ClientID); err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(req.Title) == "" {
 		return nil, newAPIError(http.StatusBadRequest, "title required")
@@ -241,9 +257,9 @@ func (h *handlers) createQuote(w http.ResponseWriter, r *http.Request) (interfac
 		normalized = append(normalized, li)
 	}
 
-	// Validate client exists
+	// Validate client exists (already user-scoped above)
 	var clientName string
-	err := h.db.QueryRow(`SELECT name FROM clients WHERE id = ?`, req.ClientID).Scan(&clientName)
+	err = h.db.QueryRow(`SELECT name FROM clients WHERE id = ? AND user_id = ?`, req.ClientID, userID).Scan(&clientName)
 	if err == sql.ErrNoRows {
 		return nil, newAPIError(http.StatusNotFound, "client not found")
 	}
@@ -260,10 +276,10 @@ func (h *handlers) createQuote(w http.ResponseWriter, r *http.Request) (interfac
 	defer tx.Rollback()
 
 	res, err := tx.Exec(`
-		INSERT INTO quotes (client_id, quote_number, title, issue_date, valid_until,
+		INSERT INTO quotes (user_id, client_id, quote_number, title, issue_date, valid_until,
 		                   subtotal, total_amount, currency, status, notes)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)
-	`, req.ClientID, quoteNumber, req.Title,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)
+	`, userID, req.ClientID, quoteNumber, req.Title,
 		issueDate.Format("2006-01-02"), validUntil.Format("2006-01-02"),
 		subtotal, subtotal, req.Currency, req.Notes)
 	if err != nil {
@@ -285,7 +301,7 @@ func (h *handlers) createQuote(w http.ResponseWriter, r *http.Request) (interfac
 		return nil, err
 	}
 
-	BroadcastEvent("quote.created", map[string]any{
+	BroadcastUserEvent(userID, "quote.created", map[string]any{
 		"source":       "api",
 		"quote_number": quoteNumber,
 		"client_id":    req.ClientID,
@@ -311,12 +327,16 @@ type updateQuoteReq struct {
 }
 
 func (h *handlers) updateQuote(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	number := r.PathValue("number")
 	var existing struct {
 		ID     int
 		Status string
 	}
-	err := h.db.QueryRow(`SELECT id, status FROM quotes WHERE quote_number = ?`, number).Scan(&existing.ID, &existing.Status)
+	err = h.db.QueryRow(`SELECT id, status FROM quotes WHERE quote_number = ? AND user_id = ?`, number, userID).Scan(&existing.ID, &existing.Status)
 	if err == sql.ErrNoRows {
 		return nil, newAPIError(http.StatusNotFound, "quote not found")
 	}
@@ -369,7 +389,7 @@ func (h *handlers) updateQuote(w http.ResponseWriter, r *http.Request) (interfac
 		if len(*req.LineItems) == 0 {
 			return nil, newAPIError(http.StatusBadRequest, "at least one line item required")
 		}
-		if _, err := tx.Exec(`DELETE FROM quote_line_items WHERE quote_id = ?`, existing.ID); err != nil {
+		if _, err := tx.Exec(`DELETE FROM quote_line_items WHERE quote_id = ? AND quote_id IN (SELECT id FROM quotes WHERE user_id = ?)`, existing.ID, userID); err != nil {
 			return nil, err
 		}
 		subtotal := 0.0
@@ -400,8 +420,8 @@ func (h *handlers) updateQuote(w http.ResponseWriter, r *http.Request) (interfac
 		return nil, newAPIError(http.StatusBadRequest, "no fields provided")
 	}
 	sets = append(sets, "updated_at = CURRENT_TIMESTAMP")
-	args = append(args, existing.ID)
-	q := fmt.Sprintf("UPDATE quotes SET %s WHERE id = ?", strings.Join(sets, ", "))
+	args = append(args, existing.ID, userID)
+	q := fmt.Sprintf("UPDATE quotes SET %s WHERE id = ? AND user_id = ?", strings.Join(sets, ", "))
 	if _, err := tx.Exec(q, args...); err != nil {
 		return nil, err
 	}
@@ -418,6 +438,10 @@ type updateQuoteStatusReq struct {
 }
 
 func (h *handlers) updateQuoteStatus(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	number := r.PathValue("number")
 	var req updateQuoteStatusReq
 	if err := decodeBody(r, &req); err != nil {
@@ -430,7 +454,7 @@ func (h *handlers) updateQuoteStatus(w http.ResponseWriter, r *http.Request) (in
 	if !valid[req.Status] {
 		return nil, newAPIError(http.StatusBadRequest, "invalid status")
 	}
-	res, err := h.db.Exec(`UPDATE quotes SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE quote_number = ?`, req.Status, number)
+	res, err := h.db.Exec(`UPDATE quotes SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE quote_number = ? AND user_id = ?`, req.Status, number, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -438,7 +462,7 @@ func (h *handlers) updateQuoteStatus(w http.ResponseWriter, r *http.Request) (in
 	if n == 0 {
 		return nil, newAPIError(http.StatusNotFound, "quote not found")
 	}
-	BroadcastEvent("quote.updated", map[string]any{
+	BroadcastUserEvent(userID, "quote.updated", map[string]any{
 		"source":       "api",
 		"quote_number": number,
 		"status":       req.Status,
@@ -449,11 +473,15 @@ func (h *handlers) updateQuoteStatus(w http.ResponseWriter, r *http.Request) (in
 // ---------- Delete ----------
 
 func (h *handlers) deleteQuote(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	number := r.PathValue("number")
 	var id int64
 	var pdfPath sql.NullString
 	var status string
-	err := h.db.QueryRow(`SELECT id, status, pdf_path FROM quotes WHERE quote_number = ?`, number).Scan(&id, &status, &pdfPath)
+	err = h.db.QueryRow(`SELECT id, status, pdf_path FROM quotes WHERE quote_number = ? AND user_id = ?`, number, userID).Scan(&id, &status, &pdfPath)
 	if err == sql.ErrNoRows {
 		return nil, newAPIError(http.StatusNotFound, "quote not found")
 	}
@@ -464,13 +492,13 @@ func (h *handlers) deleteQuote(w http.ResponseWriter, r *http.Request) (interfac
 		return nil, newAPIError(http.StatusConflict, "converted quotes cannot be deleted")
 	}
 
-	if _, err := h.db.Exec(`DELETE FROM quotes WHERE id = ?`, id); err != nil {
+	if _, err := h.db.Exec(`DELETE FROM quotes WHERE id = ? AND user_id = ?`, id, userID); err != nil {
 		return nil, err
 	}
 	if pdfPath.Valid && pdfPath.String != "" {
 		_ = os.Remove(pdfPath.String)
 	}
-	BroadcastEvent("quote.deleted", map[string]any{
+	BroadcastUserEvent(userID, "quote.deleted", map[string]any{
 		"source":       "api",
 		"quote_number": number,
 	})
@@ -479,34 +507,50 @@ func (h *handlers) deleteQuote(w http.ResponseWriter, r *http.Request) (interfac
 
 // ---------- Download PDF ----------
 
-func (h *handlers) downloadQuote(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+// downloadQuote streams the rendered quote PDF as the HTTP response body with
+// a Content-Disposition: attachment header. Mirrors downloadInvoice — see that
+// handler's comment for the rationale on why we no longer write the PDF to
+// the server's filesystem.
+func (h *handlers) downloadQuote(w http.ResponseWriter, r *http.Request) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err)
+		return
+	}
 	number := r.PathValue("number")
 
-	row := h.db.QueryRow(quoteSelect+" WHERE q.quote_number = ?", number)
+	row := h.db.QueryRow(quoteSelect+" WHERE q.quote_number = ? AND q.user_id = ?", number, userID)
 	dto, err := scanQuote(row)
 	if err == sql.ErrNoRows {
-		return nil, newAPIError(http.StatusNotFound, "quote not found")
+		writeError(w, http.StatusNotFound, fmt.Errorf("quote not found"))
+		return
 	}
 	if err != nil {
-		return nil, err
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	var client models.Client
 	err = h.db.QueryRow(`
 		SELECT id, name, COALESCE(address,''), COALESCE(city,''), COALESCE(state,''),
 		       COALESCE(zip_code,''), COALESCE(country,'')
-		FROM clients WHERE id = ?
-	`, dto.ClientID).Scan(&client.ID, &client.Name, &client.Address, &client.City, &client.State, &client.ZipCode, &client.Country)
+		FROM clients WHERE id = ? AND user_id = ?
+	`, dto.ClientID, userID).Scan(&client.ID, &client.Name, &client.Address, &client.City, &client.State, &client.ZipCode, &client.Country)
 	if err != nil {
-		return nil, err
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	itemRows, err := h.db.Query(`
 		SELECT id, quote_id, description, quantity, unit, unit_price, amount, sort_order
-		FROM quote_line_items WHERE quote_id = ? ORDER BY sort_order, id
-	`, dto.ID)
+		FROM quote_line_items
+		WHERE quote_id = ?
+		  AND quote_id IN (SELECT id FROM quotes WHERE user_id = ?)
+		ORDER BY sort_order, id
+	`, dto.ID, userID)
 	if err != nil {
-		return nil, err
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 	defer itemRows.Close()
 	var items []models.QuoteLineItem
@@ -514,16 +558,21 @@ func (h *handlers) downloadQuote(w http.ResponseWriter, r *http.Request) (interf
 		var li models.QuoteLineItem
 		if err := itemRows.Scan(&li.ID, &li.QuoteID, &li.Description, &li.Quantity,
 			&li.Unit, &li.UnitPrice, &li.Amount, &li.SortOrder); err != nil {
-			return nil, err
+			writeError(w, http.StatusInternalServerError, err)
+			return
 		}
 		items = append(items, li)
 	}
 
+	// Defense-in-depth ownership re-check: see comment in invoicePreview.
 	var recipients []models.Recipient
 	recRows, _ := h.db.Query(`
 		SELECT name, email, COALESCE(title,''), COALESCE(phone,'')
-		FROM recipients WHERE client_id = ? ORDER BY is_primary DESC
-	`, dto.ClientID)
+		FROM recipients
+		WHERE client_id = ?
+		  AND client_id IN (SELECT id FROM clients WHERE user_id = ?)
+		ORDER BY is_primary DESC
+	`, dto.ClientID, userID)
 	if recRows != nil {
 		for recRows.Next() {
 			var rcp models.Recipient
@@ -533,23 +582,7 @@ func (h *handlers) downloadQuote(w http.ResponseWriter, r *http.Request) (interf
 		recRows.Close()
 	}
 
-	var business models.BusinessInfo
-	h.db.QueryRow(`
-		SELECT id, business_name, contact_name, email, COALESCE(phone,''), COALESCE(address,''),
-		       COALESCE(city,''), COALESCE(state,''), COALESCE(zip_code,''), COALESCE(country,''),
-		       COALESCE(tax_id,''), COALESCE(website,''), COALESCE(logo_path,''), COALESCE(invoice_prefix,'INV'),
-		       COALESCE(export_path,''), updated_at
-		FROM business_info WHERE id = 1
-	`).Scan(&business.ID, &business.BusinessName, &business.ContactName, &business.Email,
-		&business.Phone, &business.Address, &business.City, &business.State,
-		&business.ZipCode, &business.Country, &business.TaxID, &business.Website,
-		&business.LogoPath, &business.InvoicePrefix, &business.ExportPath, &business.UpdatedAt)
-
-	exportDir := resolveExportDir(business.ExportPath)
-	if err := os.MkdirAll(exportDir, 0o755); err != nil {
-		return nil, newAPIError(http.StatusInternalServerError, "failed to create export dir: %s", err)
-	}
-	pdfPath := filepath.Join(exportDir, fmt.Sprintf("quote_%s_%s.pdf", number, dto.IssueDate.Format("2006-01-02")))
+	business := loadBusinessInfo(h.db, userID)
 
 	quote := models.Quote{
 		ID:          dto.ID,
@@ -568,19 +601,18 @@ func (h *handlers) downloadQuote(w http.ResponseWriter, r *http.Request) (interf
 	}
 
 	generator := pdf.NewQuoteGenerator()
-	if err := generator.Generate(quote, recipients, business, pdfPath); err != nil {
-		return nil, newAPIError(http.StatusInternalServerError, "failed to generate PDF: %s", err)
+	bytes, err := generator.GenerateBytes(quote, recipients, business)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("generate PDF: %w", err))
+		return
 	}
 
-	if _, err := h.db.Exec(`UPDATE quotes SET pdf_path = ? WHERE id = ?`, pdfPath, dto.ID); err != nil {
-		return nil, err
-	}
-
-	return map[string]interface{}{
-		"quote_number": number,
-		"pdf_path":     pdfPath,
-		"export_dir":   exportDir,
-	}, nil
+	filename := fmt.Sprintf("quote_%s_%s.pdf", number, dto.IssueDate.Format("2006-01-02"))
+	w.Header().Set("Content-Type", "application/pdf")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	w.Header().Set("Content-Length", strconv.Itoa(len(bytes)))
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(bytes)
 }
 
 // ---------- Convert to contract ----------
@@ -594,6 +626,10 @@ type convertQuoteReq struct {
 }
 
 func (h *handlers) convertQuote(w http.ResponseWriter, r *http.Request) (interface{}, error) {
+	userID, err := currentUserID(r)
+	if err != nil {
+		return nil, err
+	}
 	number := r.PathValue("number")
 	var req convertQuoteReq
 	if err := decodeBody(r, &req); err != nil {
@@ -607,9 +643,9 @@ func (h *handlers) convertQuote(w http.ResponseWriter, r *http.Request) (interfa
 	var clientID int
 	var status, currency, title string
 	var totalAmount float64
-	err := h.db.QueryRow(`
-		SELECT id, client_id, status, currency, title, total_amount FROM quotes WHERE quote_number = ?
-	`, number).Scan(&qID, &clientID, &status, &currency, &title, &totalAmount)
+	err = h.db.QueryRow(`
+		SELECT id, client_id, status, currency, title, total_amount FROM quotes WHERE quote_number = ? AND user_id = ?
+	`, number, userID).Scan(&qID, &clientID, &status, &currency, &title, &totalAmount)
 	if err == sql.ErrNoRows {
 		return nil, newAPIError(http.StatusNotFound, "quote not found")
 	}
@@ -627,8 +663,10 @@ func (h *handlers) convertQuote(w http.ResponseWriter, r *http.Request) (interfa
 	var hourQty, hourAmt float64
 	liRows, err := h.db.Query(`
 		SELECT quantity, unit, unit_price, amount FROM quote_line_items
-		WHERE quote_id = ? ORDER BY sort_order, id
-	`, qID)
+		WHERE quote_id = ?
+		  AND quote_id IN (SELECT id FROM quotes WHERE user_id = ?)
+		ORDER BY sort_order, id
+	`, qID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -686,11 +724,11 @@ func (h *handlers) convertQuote(w http.ResponseWriter, r *http.Request) (interfa
 
 	var contractID int64
 	err = tx.QueryRow(`
-		INSERT INTO contracts (client_id, contract_number, name, hourly_rate, currency, contract_type,
+		INSERT INTO contracts (user_id, client_id, contract_number, name, hourly_rate, currency, contract_type,
 		                      start_date, end_date, status, payment_terms, notes)
-		VALUES (?, ?, ?, ?, ?, 'hourly', ?, ?, 'active', ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, 'hourly', ?, ?, 'active', ?, ?)
 		RETURNING id
-	`, clientID, req.ContractNumber, name, rate, currency,
+	`, userID, clientID, req.ContractNumber, name, rate, currency,
 		start.Format("2006-01-02"), endPtr, req.PaymentTerms,
 		fmt.Sprintf("Derived from quote %s", number)).Scan(&contractID)
 	if err != nil {
@@ -699,15 +737,15 @@ func (h *handlers) convertQuote(w http.ResponseWriter, r *http.Request) (interfa
 
 	if _, err := tx.Exec(`
 		UPDATE quotes SET status = 'converted', converted_contract_id = ?, updated_at = CURRENT_TIMESTAMP
-		WHERE id = ?
-	`, contractID, qID); err != nil {
+		WHERE id = ? AND user_id = ?
+	`, contractID, qID, userID); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
-	BroadcastEvent("quote.converted", map[string]any{
+	BroadcastUserEvent(userID, "quote.converted", map[string]any{
 		"source":          "api",
 		"quote_number":    number,
 		"contract_id":     contractID,

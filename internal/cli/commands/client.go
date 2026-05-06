@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/austin/hours-mcp/internal/cli/output"
+	"github.com/austin/hours-mcp/internal/database"
 	"github.com/austin/hours-mcp/internal/models"
 )
 
@@ -39,9 +40,9 @@ func (c *ClientCommands) AddClient(args []string) error {
 	country := parsedArgs["country"]
 
 	result, err := c.db.Exec(`
-		INSERT INTO clients (name, address, city, state, zip_code, country)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, name, address, city, state, zipCode, country)
+		INSERT INTO clients (user_id, name, address, city, state, zip_code, country)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, database.DefaultUserID, name, address, city, state, zipCode, country)
 
 	if err != nil {
 		return fmt.Errorf("failed to add client: %w", err)
@@ -289,10 +290,12 @@ func (c *ClientCommands) SetPaymentDetails(args []string) error {
 	return nil
 }
 
-// getClientIDByName is a helper method to get client ID by name
+// getClientIDByName is a helper method to get client ID by name (scoped to
+// the local DefaultUserID — the CLI never touches another tenant's data).
 func (c *ClientCommands) getClientIDByName(name string) (int, error) {
 	var id int
-	err := c.db.QueryRow("SELECT id FROM clients WHERE name = ?", name).Scan(&id)
+	err := c.db.QueryRow("SELECT id FROM clients WHERE user_id = ? AND name = ?",
+		database.DefaultUserID, name).Scan(&id)
 	if err == sql.ErrNoRows {
 		return 0, fmt.Errorf("client '%s' not found", name)
 	}

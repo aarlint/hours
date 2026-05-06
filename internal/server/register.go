@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"github.com/austin/hours-mcp/internal/api"
+	"github.com/austin/hours-mcp/internal/auth"
 	"github.com/austin/hours-mcp/internal/backup"
 	"github.com/austin/hours-mcp/internal/billing"
+	"github.com/austin/hours-mcp/internal/database"
 	"github.com/austin/hours-mcp/internal/models"
 	"github.com/austin/hours-mcp/internal/pdf"
 	"github.com/austin/hours-mcp/internal/timeparse"
@@ -19,8 +21,26 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// RegisterTools registers all tools with the MCP server
-func RegisterTools(server *mcp.Server, db *sql.DB) {
+// Transport identifies which MCP transport the registration is targeting.
+// We only need this for excluding the database-wide backup/restore tools
+// from the multi-tenant HTTP MCP server — those tools operate on the
+// SQLite file as a whole and cannot be tenant-scoped, so they MUST stay
+// off the public HTTP transport.
+type Transport int
+
+const (
+	// TransportStdio is the local single-user MCP server (Claude Desktop
+	// over stdio). Every tool, including backup/restore, is registered.
+	TransportStdio Transport = iota
+	// TransportHTTP is the remote multi-tenant MCP server mounted at
+	// /api/mcp. Whole-DB tools (backup/restore) are excluded.
+	TransportHTTP
+)
+
+// RegisterTools registers all tools with the MCP server.
+// transport=TransportStdio registers everything (local single-user use).
+// transport=TransportHTTP excludes destructive whole-DB tools (backup/restore).
+func RegisterTools(server *mcp.Server, db *sql.DB, transport Transport) {
 	h := &Handler{db: db}
 
 	// Quoting tools live in quotes.go
@@ -39,11 +59,15 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "add_client",
 		Description: "Add a new client (note: rates are now managed through contracts)",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args addClientArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args addClientArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "add_client", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeClientsWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		result, err := db.Exec(`
-			INSERT INTO clients (name, address, city, state, zip_code, country)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`, args.Name, args.Address, args.City, args.State, args.ZipCode, args.Country)
+			INSERT INTO clients (user_id, name, address, city, state, zip_code, country)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, userIDFromCtx(ctx), args.Name, args.Address, args.City, args.State, args.ZipCode, args.Country)
 
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to add client: %w", err)
@@ -66,7 +90,11 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_clients",
 		Description: "List all clients",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args listClientsArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args listClientsArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "list_clients", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeClientsRead); err != nil {
+			return scopeError(err), nil, nil
+		}
 		rows, err := db.Query(`
 			SELECT id, name, address, city, state, zip_code, country, created_at, updated_at
 			FROM clients
@@ -106,7 +134,7 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 			Content: []mcp.Content{
 				&mcp.TextContent{Text: text},
 			},
-		}, clients, nil
+		}, wrapList("clients", clients), nil
 	})
 
 	// Edit Client tool
@@ -123,9 +151,13 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "edit_client",
 		Description: "Edit an existing client's information",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args editClientArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args editClientArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "edit_client", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeClientsWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		// Get current client ID
-		clientID, err := h.getClientIDByName(args.Name)
+		clientID, err := h.getClientIDByName(userIDFromCtx(ctx), args.Name)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to find client: %w", err)
 		}
@@ -207,9 +239,13 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "add_contract",
 		Description: "Add a new contract for a client with specific rates and terms",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args addContractArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args addContractArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "add_contract", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeContractsWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		// Get client ID
-		clientID, err := h.getClientIDByName(args.ClientName)
+		clientID, err := h.getClientIDByName(userIDFromCtx(ctx), args.ClientName)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to find client: %w", err)
 		}
@@ -253,10 +289,10 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 		// Insert contract
 		var contractID int64
 		err = db.QueryRow(`
-			INSERT INTO contracts (client_id, contract_number, name, hourly_rate, currency, contract_type, start_date, end_date, payment_terms, notes, billing_cycle_day, billing_cycle_type, auto_bill_enabled)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO contracts (user_id, client_id, contract_number, name, hourly_rate, currency, contract_type, start_date, end_date, payment_terms, notes, billing_cycle_day, billing_cycle_type, auto_bill_enabled)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			RETURNING id
-		`, clientID, args.ContractNumber, args.Name, args.HourlyRate, args.Currency, args.ContractType, startDate.Format("2006-01-02"),
+		`, userIDFromCtx(ctx), clientID, args.ContractNumber, args.Name, args.HourlyRate, args.Currency, args.ContractType, startDate.Format("2006-01-02"),
 			func() interface{} {
 				if endDate != nil {
 					return endDate.Format("2006-01-02")
@@ -326,7 +362,11 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_contracts",
 		Description: "List contracts with optional filtering by client or status",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args listContractsArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args listContractsArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "list_contracts", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeContractsRead); err != nil {
+			return scopeError(err), nil, nil
+		}
 		query := `
 			SELECT c.id, c.contract_number, c.name, c.hourly_rate, c.currency, c.contract_type,
 			       c.start_date, c.end_date, c.status, c.payment_terms, cl.name as client_name
@@ -390,7 +430,7 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 			Content: []mcp.Content{
 				&mcp.TextContent{Text: text},
 			},
-		}, contracts, nil
+		}, wrapList("contracts", contracts), nil
 	})
 
 	// Add Recipient tool
@@ -406,8 +446,12 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "add_recipient",
 		Description: "Add a recipient for a client",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args addRecipientArgs) (*mcp.CallToolResult, any, error) {
-		clientID, err := h.getClientIDByName(args.ClientName)
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args addRecipientArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "add_recipient", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeRecipientsWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
+		clientID, err := h.getClientIDByName(userIDFromCtx(ctx), args.ClientName)
 		if err != nil {
 			return nil, nil, fmt.Errorf("client not found: %w", err)
 		}
@@ -450,8 +494,12 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_recipients",
 		Description: "List all recipients for a client",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args listRecipientsArgs) (*mcp.CallToolResult, any, error) {
-		clientID, err := h.getClientIDByName(args.ClientName)
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args listRecipientsArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "list_recipients", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeRecipientsRead); err != nil {
+			return scopeError(err), nil, nil
+		}
+		clientID, err := h.getClientIDByName(userIDFromCtx(ctx), args.ClientName)
 		if err != nil {
 			return nil, nil, fmt.Errorf("client not found: %w", err)
 		}
@@ -514,7 +562,7 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 			Content: []mcp.Content{
 				&mcp.TextContent{Text: text},
 			},
-		}, recipients, nil
+		}, wrapList("recipients", recipients), nil
 	})
 
 	// Remove Recipient tool
@@ -525,7 +573,11 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "remove_recipient",
 		Description: "Remove a recipient by ID",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args removeRecipientArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args removeRecipientArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "remove_recipient", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeRecipientsWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		// First check if recipient exists and get details
 		var name, email string
 		var clientID int
@@ -574,8 +626,12 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "set_payment_details",
 		Description: "Set payment details for a client",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args setPaymentDetailsArgs) (*mcp.CallToolResult, any, error) {
-		clientID, err := h.getClientIDByName(args.ClientName)
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args setPaymentDetailsArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "set_payment_details", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopePaymentMethodsWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
+		clientID, err := h.getClientIDByName(userIDFromCtx(ctx), args.ClientName)
 		if err != nil {
 			return nil, nil, fmt.Errorf("client not found: %w", err)
 		}
@@ -618,7 +674,11 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "add_hours",
 		Description: "Add hours worked against a specific contract (supports 15-minute increments: 0.25 = 15 min, 0.5 = 30 min, 0.75 = 45 min)",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args addHoursArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args addHoursArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "add_hours", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeTimeEntriesWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		// Get contract and verify it's active
 		var contractID int
 		var clientID int
@@ -654,9 +714,9 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 		entryID := uuid.New().String()
 
 		_, err = db.Exec(`
-			INSERT INTO time_entries (id, client_id, contract_id, date, hours, description, contract_ref)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
-		`, entryID, clientID, contractID, date.Format("2006-01-02"), args.Hours, args.Description, args.ContractNumber)
+			INSERT INTO time_entries (id, user_id, client_id, contract_id, date, hours, description, contract_ref)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`, entryID, userIDFromCtx(ctx), clientID, contractID, date.Format("2006-01-02"), args.Hours, args.Description, args.ContractNumber)
 
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to add hours: %w", err)
@@ -681,7 +741,11 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_hours",
 		Description: "List hours for a client within a date range",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args listHoursArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args listHoursArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "list_hours", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeTimeEntriesRead); err != nil {
+			return scopeError(err), nil, nil
+		}
 		query := `
 			SELECT te.id, te.contract_id, te.date, te.hours, te.description, te.invoice_id, te.created_at,
 			       cl.name, ct.contract_number, ct.name, ct.hourly_rate, ct.currency
@@ -693,7 +757,7 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 		queryArgs := []interface{}{}
 
 		if args.ClientName != "" {
-			clientID, err := h.getClientIDByName(args.ClientName)
+			clientID, err := h.getClientIDByName(userIDFromCtx(ctx), args.ClientName)
 			if err != nil {
 				return nil, nil, fmt.Errorf("client not found: %w", err)
 			}
@@ -765,7 +829,7 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 			Content: []mcp.Content{
 				&mcp.TextContent{Text: text},
 			},
-		}, entries, nil
+		}, wrapListWith("entries", entries, map[string]any{"total_hours": totalHours}), nil
 	})
 
 	// Create Invoice tool
@@ -778,19 +842,23 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "create_invoice",
 		Description: "Create an invoice for a client",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args createInvoiceArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args createInvoiceArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "create_invoice", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeInvoicesWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		if args.DueDays == 0 {
 			args.DueDays = 30
 		}
 
-		clientID, err := h.getClientIDByName(args.ClientName)
+		clientID, err := h.getClientIDByName(userIDFromCtx(ctx), args.ClientName)
 		if err != nil {
 			return nil, nil, fmt.Errorf("client not found: %w", err)
 		}
 
 		// Validate business information is configured
 		var businessName string
-		err = db.QueryRow("SELECT business_name FROM business_info WHERE id = 1").Scan(&businessName)
+		err = db.QueryRow("SELECT business_name FROM business_info WHERE user_id = ?", userIDFromCtx(ctx)).Scan(&businessName)
 		if err == sql.ErrNoRows {
 			return nil, nil, fmt.Errorf("business information not configured. Please use 'set_business_info' to configure your business details before creating invoices")
 		} else if err != nil {
@@ -896,9 +964,9 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 		`, clientID).Scan(&paymentMethodID)
 
 		result, err := tx.Exec(`
-			INSERT INTO invoices (client_id, invoice_number, issue_date, due_date, total_amount, status, payment_method_id)
-			VALUES (?, ?, ?, ?, ?, 'pending', ?)
-		`, clientID, invoiceNumber, issueDate.Format("2006-01-02"), dueDate.Format("2006-01-02"), totalAmount, paymentMethodID)
+			INSERT INTO invoices (user_id, client_id, invoice_number, issue_date, due_date, total_amount, status, payment_method_id)
+			VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+		`, userIDFromCtx(ctx), clientID, invoiceNumber, issueDate.Format("2006-01-02"), dueDate.Format("2006-01-02"), totalAmount, paymentMethodID)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to create invoice: %w", err)
 		}
@@ -918,7 +986,7 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 			Expenses:      expenses,
 		}
 
-		paymentDetails := api.ResolveInvoicePaymentDetails(db, invoiceID, clientID)
+		paymentDetails := api.ResolveInvoicePaymentDetails(db, userIDFromCtx(ctx), invoiceID, clientID)
 
 		var recipients []models.Recipient
 		recipientRows, err := db.Query(`
@@ -936,9 +1004,9 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 
 		var business models.BusinessInfo
 		db.QueryRow(`
-			SELECT id, business_name, contact_name, email, phone, address, city, state, zip_code, country, tax_id, website, logo_path, invoice_prefix, updated_at
-			FROM business_info WHERE id = 1
-		`).Scan(&business.ID, &business.BusinessName, &business.ContactName, &business.Email,
+			SELECT user_id, business_name, contact_name, email, phone, address, city, state, zip_code, country, tax_id, website, logo_path, invoice_prefix, updated_at
+			FROM business_info WHERE user_id = ?
+		`, userIDFromCtx(ctx)).Scan(&business.ID, &business.BusinessName, &business.ContactName, &business.Email,
 			&business.Phone, &business.Address, &business.City, &business.State,
 			&business.ZipCode, &business.Country, &business.TaxID, &business.Website,
 			&business.LogoPath, &business.InvoicePrefix, &business.UpdatedAt)
@@ -1015,7 +1083,11 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "delete_time_entry",
 		Description: "Delete a specific time entry by ID",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args deleteTimeEntryArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args deleteTimeEntryArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "delete_time_entry", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeTimeEntriesWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		var clientName string
 		var date, hours, description string
 		err := db.QueryRow(`
@@ -1059,7 +1131,11 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "bulk_delete_time_entries",
 		Description: "Delete multiple time entries by their IDs",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args bulkDeleteTimeEntriesArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args bulkDeleteTimeEntriesArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "bulk_delete_time_entries", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeTimeEntriesWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		if len(args.EntryIDs) == 0 {
 			return nil, nil, fmt.Errorf("no entry IDs provided")
 		}
@@ -1138,7 +1214,11 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "bulk_add_hours",
 		Description: "Add multiple time entries at once (supports 15-minute increments: 0.25 = 15 min, 0.5 = 30 min, 0.75 = 45 min)",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args bulkAddHoursArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args bulkAddHoursArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "bulk_add_hours", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeTimeEntriesWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		if len(args.Entries) == 0 {
 			return nil, nil, fmt.Errorf("no entries provided")
 		}
@@ -1154,7 +1234,7 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 		var totalHours float64
 
 		for _, entry := range args.Entries {
-			clientID, err := h.getClientIDByName(entry.ClientName)
+			clientID, err := h.getClientIDByName(userIDFromCtx(ctx), entry.ClientName)
 			if err != nil {
 				return nil, nil, fmt.Errorf("client '%s' not found: %w", entry.ClientName, err)
 			}
@@ -1177,9 +1257,9 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 			entryID := uuid.New().String()
 
 			_, err = tx.Exec(`
-				INSERT INTO time_entries (id, client_id, contract_id, date, hours, description, contract_ref)
-				VALUES (?, ?, ?, ?, ?, ?, ?)
-			`, entryID, clientID, contractID, date.Format("2006-01-02"), entry.Hours, entry.Description, entry.ContractRef)
+				INSERT INTO time_entries (id, user_id, client_id, contract_id, date, hours, description, contract_ref)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			`, entryID, userIDFromCtx(ctx), clientID, contractID, date.Format("2006-01-02"), entry.Hours, entry.Description, entry.ContractRef)
 
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to add entry for %s: %w", entry.ClientName, err)
@@ -1220,7 +1300,11 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "get_time_entry_details",
 		Description: "Get detailed information about a specific time entry",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args getTimeEntryDetailsArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args getTimeEntryDetailsArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "get_time_entry_details", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeTimeEntriesRead); err != nil {
+			return scopeError(err), nil, nil
+		}
 		var entry models.TimeEntry
 		var clientName string
 
@@ -1277,7 +1361,11 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "update_time_entry",
 		Description: "Update an existing time entry (hours support 15-minute increments: 0.25 = 15 min, 0.5 = 30 min, 0.75 = 45 min)",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args updateTimeEntryArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args updateTimeEntryArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "update_time_entry", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeTimeEntriesWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		var entry models.TimeEntry
 		var clientName string
 
@@ -1359,7 +1447,11 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "search_time_entries",
 		Description: "Search time entries with various filters",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args searchTimeEntriesArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args searchTimeEntriesArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "search_time_entries", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeTimeEntriesRead); err != nil {
+			return scopeError(err), nil, nil
+		}
 		query := `
 			SELECT te.id, te.contract_id, te.date, te.hours, te.description, te.invoice_id, te.created_at,
 			       cl.name, ct.contract_number, ct.name, ct.hourly_rate, ct.currency
@@ -1371,7 +1463,7 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 		queryArgs := []interface{}{}
 
 		if args.ClientName != "" {
-			clientID, err := h.getClientIDByName(args.ClientName)
+			clientID, err := h.getClientIDByName(userIDFromCtx(ctx), args.ClientName)
 			if err != nil {
 				return nil, nil, fmt.Errorf("client not found: %w", err)
 			}
@@ -1492,7 +1584,11 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "mark_time_entries_invoiced",
 		Description: "Mark specific time entries as invoiced by linking them to an invoice",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args markTimeEntriesInvoicedArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args markTimeEntriesInvoicedArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "mark_time_entries_invoiced", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeTimeEntriesWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		if len(args.EntryIDs) == 0 {
 			return nil, nil, fmt.Errorf("no entry IDs provided")
 		}
@@ -1582,7 +1678,11 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "unmark_time_entries_from_invoice",
 		Description: "Remove invoice association from time entries, making them available for billing again",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args unmarkTimeEntriesArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args unmarkTimeEntriesArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "unmark_time_entries_from_invoice", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeTimeEntriesWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		if len(args.EntryIDs) == 0 {
 			return nil, nil, fmt.Errorf("no entry IDs provided")
 		}
@@ -1662,7 +1762,11 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_invoice_details",
 		Description: "Get detailed information about an invoice including all associated time entries",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args listInvoiceDetailsArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args listInvoiceDetailsArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "list_invoice_details", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeInvoicesRead); err != nil {
+			return scopeError(err), nil, nil
+		}
 		var invoice models.Invoice
 		var clientName string
 
@@ -1784,15 +1888,19 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "set_business_info",
 		Description: "Set or update your business information for invoices",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args setBusinessInfoArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args setBusinessInfoArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "set_business_info", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeBusinessInfoWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		if args.InvoicePrefix == "" {
 			args.InvoicePrefix = "INV"
 		}
 
 		_, err := db.Exec(`
-			INSERT INTO business_info (id, business_name, contact_name, email, phone, address, city, state, zip_code, country, tax_id, website, logo_path, invoice_prefix, updated_at)
-			VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(id) DO UPDATE SET
+			INSERT INTO business_info (user_id, business_name, contact_name, email, phone, address, city, state, zip_code, country, tax_id, website, logo_path, invoice_prefix, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(user_id) DO UPDATE SET
 				business_name = excluded.business_name,
 				contact_name = excluded.contact_name,
 				email = excluded.email,
@@ -1807,7 +1915,7 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 				logo_path = excluded.logo_path,
 				invoice_prefix = excluded.invoice_prefix,
 				updated_at = excluded.updated_at
-		`, args.BusinessName, args.ContactName, args.Email, args.Phone, args.Address,
+		`, userIDFromCtx(ctx), args.BusinessName, args.ContactName, args.Email, args.Phone, args.Address,
 			args.City, args.State, args.ZipCode, args.Country, args.TaxID,
 			args.Website, args.LogoPath, args.InvoicePrefix, time.Now())
 
@@ -1830,12 +1938,16 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "get_business_info",
 		Description: "Get current business information settings",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args getBusinessInfoArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args getBusinessInfoArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "get_business_info", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeBusinessInfoRead); err != nil {
+			return scopeError(err), nil, nil
+		}
 		var business models.BusinessInfo
 		err := db.QueryRow(`
-			SELECT id, business_name, contact_name, email, phone, address, city, state, zip_code, country, tax_id, website, logo_path, invoice_prefix, updated_at
-			FROM business_info WHERE id = 1
-		`).Scan(&business.ID, &business.BusinessName, &business.ContactName, &business.Email,
+			SELECT user_id, business_name, contact_name, email, phone, address, city, state, zip_code, country, tax_id, website, logo_path, invoice_prefix, updated_at
+			FROM business_info WHERE user_id = ?
+		`, userIDFromCtx(ctx)).Scan(&business.ID, &business.BusinessName, &business.ContactName, &business.Email,
 			&business.Phone, &business.Address, &business.City, &business.State,
 			&business.ZipCode, &business.Country, &business.TaxID, &business.Website,
 			&business.LogoPath, &business.InvoicePrefix, &business.UpdatedAt)
@@ -1902,7 +2014,11 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "update_invoice_status",
 		Description: "Update the status of an invoice",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args updateInvoiceStatusArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args updateInvoiceStatusArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "update_invoice_status", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeInvoicesWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		validStatuses := map[string]bool{
 			"draft":     true,
 			"sent":      true,
@@ -1948,7 +2064,11 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_invoices",
 		Description: "List invoices with optional filters",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args listInvoicesArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args listInvoicesArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "list_invoices", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeInvoicesRead); err != nil {
+			return scopeError(err), nil, nil
+		}
 		query := `
 			SELECT i.id, i.invoice_number, i.issue_date, i.due_date, i.total_amount, i.status, c.name
 			FROM invoices i
@@ -1958,7 +2078,7 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 		queryArgs := []interface{}{}
 
 		if args.ClientName != "" {
-			clientID, err := h.getClientIDByName(args.ClientName)
+			clientID, err := h.getClientIDByName(userIDFromCtx(ctx), args.ClientName)
 			if err != nil {
 				return nil, nil, fmt.Errorf("client not found: %w", err)
 			}
@@ -2038,222 +2158,12 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 			}, nil
 	})
 
-	// Database Backup tool
-	type createBackupArgs struct {
-		BackupPath string `json:"backup_path" jsonschema:"Path to save the backup file"`
-		Validate   bool   `json:"validate,omitempty" jsonschema:"Validate backup after creation (default: true)"`
+	// Backup/restore tools operate on the entire SQLite file (every user's
+	// data) and cannot be tenant-scoped. Register them ONLY on stdio — the
+	// HTTP MCP server must never expose them to remote tokens.
+	if transport == TransportStdio {
+		registerBackupTools(server, db)
 	}
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "create_database_backup",
-		Description: "Create a backup of the database",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args createBackupArgs) (*mcp.CallToolResult, any, error) {
-		backupService := backup.New(db)
-
-		// Auto-generate filename if only directory is provided
-		if strings.HasSuffix(args.BackupPath, "/") || isDirectory(args.BackupPath) {
-			autoBackupPath, err := backupService.CreateAutoBackup(args.BackupPath)
-			if err != nil {
-				return nil, nil, fmt.Errorf("failed to create backup: %w", err)
-			}
-
-			if args.Validate {
-				if err := backupService.ValidateBackup(autoBackupPath); err != nil {
-					return &mcp.CallToolResult{
-						Content: []mcp.Content{
-							&mcp.TextContent{
-								Text: fmt.Sprintf("Backup created but validation failed: %s\nPath: %s", err.Error(), autoBackupPath),
-							},
-						},
-					}, map[string]interface{}{
-						"backup_path": autoBackupPath,
-						"validated":   false,
-						"error":       err.Error(),
-					}, nil
-				}
-			}
-
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{
-					&mcp.TextContent{
-						Text: fmt.Sprintf("Database backup created successfully: %s", autoBackupPath),
-					},
-				},
-			}, map[string]interface{}{
-				"backup_path": autoBackupPath,
-				"validated":   args.Validate,
-			}, nil
-		}
-
-		// Manual backup path
-		if err := backupService.Backup(args.BackupPath); err != nil {
-			return nil, nil, fmt.Errorf("failed to create backup: %w", err)
-		}
-
-		validated := false
-		validationError := ""
-		if args.Validate {
-			if err := backupService.ValidateBackup(args.BackupPath); err != nil {
-				validationError = err.Error()
-			} else {
-				validated = true
-			}
-		}
-
-		message := fmt.Sprintf("Database backup created successfully: %s", args.BackupPath)
-		if args.Validate {
-			if validated {
-				message += "\nBackup validation: PASSED"
-			} else {
-				message += fmt.Sprintf("\nBackup validation: FAILED - %s", validationError)
-			}
-		}
-
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{Text: message},
-			},
-		}, map[string]interface{}{
-			"backup_path":      args.BackupPath,
-			"validated":        validated,
-			"validation_error": validationError,
-		}, nil
-	})
-
-	// Database Restore tool
-	type restoreBackupArgs struct {
-		BackupPath       string `json:"backup_path" jsonschema:"Path to the backup file to restore from"`
-		SkipValidation   bool   `json:"skip_validation,omitempty" jsonschema:"Skip backup validation before restore"`
-		ConfirmRestore   bool   `json:"confirm_restore" jsonschema:"Confirm that you want to replace the current database"`
-	}
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "restore_database_backup",
-		Description: "Restore the database from a backup file (WARNING: This will replace your current database)",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args restoreBackupArgs) (*mcp.CallToolResult, any, error) {
-		if !args.ConfirmRestore {
-			return nil, nil, fmt.Errorf("restore cancelled - you must set confirm_restore to true to proceed")
-		}
-
-		backupService := backup.New(db)
-
-		// Validate backup before restoring unless explicitly skipped
-		if !args.SkipValidation {
-			if err := backupService.ValidateBackup(args.BackupPath); err != nil {
-				return nil, nil, fmt.Errorf("backup validation failed: %w", err)
-			}
-		}
-
-		if err := backupService.Restore(args.BackupPath); err != nil {
-			return nil, nil, fmt.Errorf("failed to restore backup: %w", err)
-		}
-
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{
-					Text: fmt.Sprintf("Database restored successfully from: %s\nApplication restart may be required for changes to take effect.", args.BackupPath),
-				},
-			},
-		}, map[string]interface{}{
-			"backup_path": args.BackupPath,
-			"restored":    true,
-		}, nil
-	})
-
-	// List Backups tool
-	type listBackupsArgs struct {
-		BackupDirectory string `json:"backup_directory,omitempty" jsonschema:"Directory to search for backup files (optional)"`
-	}
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "list_database_backups",
-		Description: "List available database backup files",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args listBackupsArgs) (*mcp.CallToolResult, any, error) {
-		backupDir := args.BackupDirectory
-		if backupDir == "" {
-			// Default to user's home directory + /hours-backups
-			homeDir, err := os.UserHomeDir()
-			if err != nil {
-				return nil, nil, fmt.Errorf("failed to get home directory: %w", err)
-			}
-			backupDir = filepath.Join(homeDir, "hours-backups")
-		}
-
-		backupService := backup.New(db)
-		backups, err := backupService.ListBackups(backupDir)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to list backups: %w", err)
-		}
-
-		if len(backups) == 0 {
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{
-					&mcp.TextContent{
-						Text: fmt.Sprintf("No backup files found in: %s", backupDir),
-					},
-				},
-			}, map[string]interface{}{
-				"backup_directory": backupDir,
-				"backups":          []interface{}{},
-				"count":            0,
-			}, nil
-		}
-
-		text := fmt.Sprintf("Found %d backup files in %s:\n", len(backups), backupDir)
-		for _, backup := range backups {
-			text += fmt.Sprintf("- %s (Size: %s, Modified: %s)\n",
-				backup.Name,
-				formatBytes(backup.Size),
-				backup.ModTime.Format("2006-01-02 15:04:05"))
-		}
-
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{Text: text},
-			},
-		}, map[string]interface{}{
-			"backup_directory": backupDir,
-			"backups":          backups,
-			"count":            len(backups),
-		}, nil
-	})
-
-	// Validate Backup tool
-	type validateBackupArgs struct {
-		BackupPath string `json:"backup_path" jsonschema:"Path to the backup file to validate"`
-	}
-
-	mcp.AddTool(server, &mcp.Tool{
-		Name:        "validate_database_backup",
-		Description: "Validate that a backup file is valid and contains expected data",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args validateBackupArgs) (*mcp.CallToolResult, any, error) {
-		backupService := backup.New(db)
-
-		if err := backupService.ValidateBackup(args.BackupPath); err != nil {
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{
-					&mcp.TextContent{
-						Text: fmt.Sprintf("Backup validation failed: %s", err.Error()),
-					},
-				},
-			}, map[string]interface{}{
-				"backup_path": args.BackupPath,
-				"valid":       false,
-				"error":       err.Error(),
-			}, nil
-		}
-
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{
-					Text: fmt.Sprintf("Backup file is valid: %s", args.BackupPath),
-				},
-			},
-		}, map[string]interface{}{
-			"backup_path": args.BackupPath,
-			"valid":       true,
-		}, nil
-	})
 
 	// List Ready to Bill Contracts tool
 	type listReadyToBillArgs struct {
@@ -2264,7 +2174,11 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_contracts_ready_for_billing",
 		Description: "List contracts that are ready to be billed based on their billing cycles",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args listReadyToBillArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args listReadyToBillArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "list_contracts_ready_for_billing", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeContractsRead); err != nil {
+			return scopeError(err), nil, nil
+		}
 		query := `
 			SELECT c.id, c.contract_number, c.name, c.hourly_rate, c.currency, c.contract_type,
 			       c.start_date, c.end_date, c.status, c.payment_terms, cl.name as client_name,
@@ -2397,7 +2311,11 @@ func RegisterTools(server *mcp.Server, db *sql.DB) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "calculate_billing_period",
 		Description: "Calculate the billing period for a contract based on its billing cycle",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args calculateBillingPeriodArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args calculateBillingPeriodArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "calculate_billing_period", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeContractsRead); err != nil {
+			return scopeError(err), nil, nil
+		}
 		// Get contract details
 		query := `
 			SELECT c.id, c.contract_number, c.name, c.start_date, c.billing_cycle_day, c.billing_cycle_type, cl.name
@@ -2486,7 +2404,11 @@ func registerExpenseTools(server *mcp.Server, db *sql.DB, h *Handler) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "add_expense",
 		Description: "Add a billable expense for a client (will be included in next invoice)",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args addExpenseArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args addExpenseArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "add_expense", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeExpensesWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		if args.Amount <= 0 {
 			return nil, nil, fmt.Errorf("amount must be greater than 0")
 		}
@@ -2497,7 +2419,7 @@ func registerExpenseTools(server *mcp.Server, db *sql.DB, h *Handler) {
 			args.Currency = "USD"
 		}
 
-		clientID, err := h.getClientIDByName(args.ClientName)
+		clientID, err := h.getClientIDByName(userIDFromCtx(ctx), args.ClientName)
 		if err != nil {
 			return nil, nil, fmt.Errorf("client not found: %w", err)
 		}
@@ -2522,9 +2444,9 @@ func registerExpenseTools(server *mcp.Server, db *sql.DB, h *Handler) {
 
 		id := uuid.New().String()
 		_, err = db.Exec(`
-			INSERT INTO expenses (id, client_id, contract_id, date, description, amount, currency, category, receipt_path)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, id, clientID, contractID, date.Format("2006-01-02"), args.Description, args.Amount,
+			INSERT INTO expenses (id, user_id, client_id, contract_id, date, description, amount, currency, category, receipt_path)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, id, userIDFromCtx(ctx), clientID, contractID, date.Format("2006-01-02"), args.Description, args.Amount,
 			args.Currency, nullIfEmpty(args.Category), nullIfEmpty(args.ReceiptPath))
 
 		if err != nil {
@@ -2555,7 +2477,11 @@ func registerExpenseTools(server *mcp.Server, db *sql.DB, h *Handler) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "list_expenses",
 		Description: "List expenses with optional filtering by client, period, and invoice status",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args listExpensesArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args listExpensesArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "list_expenses", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeExpensesRead); err != nil {
+			return scopeError(err), nil, nil
+		}
 		query := `
 			SELECT e.id, e.client_id, e.contract_id, e.date, e.description, e.amount, e.currency,
 			       COALESCE(e.category, ''), COALESCE(e.receipt_path, ''), e.invoice_id, c.name
@@ -2566,7 +2492,7 @@ func registerExpenseTools(server *mcp.Server, db *sql.DB, h *Handler) {
 		var params []interface{}
 
 		if args.ClientName != "" {
-			clientID, err := h.getClientIDByName(args.ClientName)
+			clientID, err := h.getClientIDByName(userIDFromCtx(ctx), args.ClientName)
 			if err != nil {
 				return nil, nil, fmt.Errorf("client not found: %w", err)
 			}
@@ -2653,7 +2579,11 @@ func registerExpenseTools(server *mcp.Server, db *sql.DB, h *Handler) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "update_expense",
 		Description: "Update an unbilled expense",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args updateExpenseArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args updateExpenseArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "update_expense", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeExpensesWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		var invoiceID *int
 		err := db.QueryRow(`SELECT invoice_id FROM expenses WHERE id = ?`, args.ID).Scan(&invoiceID)
 		if err == sql.ErrNoRows {
@@ -2722,7 +2652,11 @@ func registerExpenseTools(server *mcp.Server, db *sql.DB, h *Handler) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "delete_expense",
 		Description: "Delete an unbilled expense",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args deleteExpenseArgs) (*mcp.CallToolResult, any, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args deleteExpenseArgs) (toolResult *mcp.CallToolResult, _ any, toolErr error) {
+		defer recordToolCall(ctx, db, "delete_expense", &toolResult, &toolErr, time.Now())
+		if err := requireScopes(ctx, auth.ScopeExpensesWrite); err != nil {
+			return scopeError(err), nil, nil
+		}
 		var invoiceID *int
 		err := db.QueryRow(`SELECT invoice_id FROM expenses WHERE id = ?`, args.ID).Scan(&invoiceID)
 		if err == sql.ErrNoRows {
@@ -2755,9 +2689,25 @@ type Handler struct {
 	db *sql.DB
 }
 
-func (h *Handler) getClientIDByName(name string) (int, error) {
+// userIDFromCtx returns the user id attached to the MCP request context. The
+// stdio entrypoint wraps the context with auth.WithLocalUser(DefaultUserID)
+// so single-user local use keeps working; the HTTP MCP endpoint relies on
+// the OIDC middleware to put the real user there. If neither is set we fall
+// back to DefaultUserID — the SQL is still scoped, just to user 1.
+func userIDFromCtx(ctx context.Context) int64 {
+	if u, ok := auth.UserFromContext(ctx); ok && u != nil {
+		return u.ID
+	}
+	return database.DefaultUserID
+}
+
+// getClientIDByName looks up a client by name scoped to the supplied user.
+// Tool handlers pass userIDFromCtx(ctx) so the lookup honours the
+// authenticated user (or the local synthetic user for stdio MCP).
+func (h *Handler) getClientIDByName(userID int64, name string) (int, error) {
 	var id int
-	err := h.db.QueryRow("SELECT id FROM clients WHERE name = ?", name).Scan(&id)
+	err := h.db.QueryRow("SELECT id FROM clients WHERE user_id = ? AND name = ?",
+		userID, name).Scan(&id)
 	if err == sql.ErrNoRows {
 		return 0, fmt.Errorf("client '%s' not found", name)
 	}
@@ -2785,4 +2735,231 @@ func formatBytes(bytes int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+// registerBackupTools wires the four whole-DB backup/restore tools.
+//
+// These tools intentionally bypass per-tenant scoping because the SQLite
+// file is the unit of backup — there is no per-user "slice" to back up.
+// That makes them safe ONLY on the local stdio transport (single-user
+// Claude Desktop). On the multi-tenant HTTP transport they would let any
+// authenticated caller dump or overwrite every tenant's data, so the
+// caller MUST gate this on transport == TransportStdio.
+func registerBackupTools(server *mcp.Server, db *sql.DB) {
+	// Database Backup tool
+	type createBackupArgs struct {
+		BackupPath string `json:"backup_path" jsonschema:"Path to save the backup file"`
+		Validate   bool   `json:"validate,omitempty" jsonschema:"Validate backup after creation (default: true)"`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "create_database_backup",
+		Description: "Create a backup of the database",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args createBackupArgs) (*mcp.CallToolResult, any, error) {
+		backupService := backup.New(db)
+
+		// Auto-generate filename if only directory is provided
+		if strings.HasSuffix(args.BackupPath, "/") || isDirectory(args.BackupPath) {
+			autoBackupPath, err := backupService.CreateAutoBackup(args.BackupPath)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to create backup: %w", err)
+			}
+
+			if args.Validate {
+				if err := backupService.ValidateBackup(autoBackupPath); err != nil {
+					return &mcp.CallToolResult{
+						Content: []mcp.Content{
+							&mcp.TextContent{
+								Text: fmt.Sprintf("Backup created but validation failed: %s\nPath: %s", err.Error(), autoBackupPath),
+							},
+						},
+					}, map[string]interface{}{
+						"backup_path": autoBackupPath,
+						"validated":   false,
+						"error":       err.Error(),
+					}, nil
+				}
+			}
+
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{
+						Text: fmt.Sprintf("Database backup created successfully: %s", autoBackupPath),
+					},
+				},
+			}, map[string]interface{}{
+				"backup_path": autoBackupPath,
+				"validated":   args.Validate,
+			}, nil
+		}
+
+		// Manual backup path
+		if err := backupService.Backup(args.BackupPath); err != nil {
+			return nil, nil, fmt.Errorf("failed to create backup: %w", err)
+		}
+
+		validated := false
+		validationError := ""
+		if args.Validate {
+			if err := backupService.ValidateBackup(args.BackupPath); err != nil {
+				validationError = err.Error()
+			} else {
+				validated = true
+			}
+		}
+
+		message := fmt.Sprintf("Database backup created successfully: %s", args.BackupPath)
+		if args.Validate {
+			if validated {
+				message += "\nBackup validation: PASSED"
+			} else {
+				message += fmt.Sprintf("\nBackup validation: FAILED - %s", validationError)
+			}
+		}
+
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: message},
+			},
+		}, map[string]interface{}{
+			"backup_path":      args.BackupPath,
+			"validated":        validated,
+			"validation_error": validationError,
+		}, nil
+	})
+
+	// Database Restore tool
+	type restoreBackupArgs struct {
+		BackupPath     string `json:"backup_path" jsonschema:"Path to the backup file to restore from"`
+		SkipValidation bool   `json:"skip_validation,omitempty" jsonschema:"Skip backup validation before restore"`
+		ConfirmRestore bool   `json:"confirm_restore" jsonschema:"Confirm that you want to replace the current database"`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "restore_database_backup",
+		Description: "Restore the database from a backup file (WARNING: This will replace your current database)",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args restoreBackupArgs) (*mcp.CallToolResult, any, error) {
+		if !args.ConfirmRestore {
+			return nil, nil, fmt.Errorf("restore cancelled - you must set confirm_restore to true to proceed")
+		}
+
+		backupService := backup.New(db)
+
+		// Validate backup before restoring unless explicitly skipped
+		if !args.SkipValidation {
+			if err := backupService.ValidateBackup(args.BackupPath); err != nil {
+				return nil, nil, fmt.Errorf("backup validation failed: %w", err)
+			}
+		}
+
+		if err := backupService.Restore(args.BackupPath); err != nil {
+			return nil, nil, fmt.Errorf("failed to restore backup: %w", err)
+		}
+
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{
+					Text: fmt.Sprintf("Database restored successfully from: %s\nApplication restart may be required for changes to take effect.", args.BackupPath),
+				},
+			},
+		}, map[string]interface{}{
+			"backup_path": args.BackupPath,
+			"restored":    true,
+		}, nil
+	})
+
+	// List Backups tool
+	type listBackupsArgs struct {
+		BackupDirectory string `json:"backup_directory,omitempty" jsonschema:"Directory to search for backup files (optional)"`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "list_database_backups",
+		Description: "List available database backup files",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args listBackupsArgs) (*mcp.CallToolResult, any, error) {
+		backupDir := args.BackupDirectory
+		if backupDir == "" {
+			// Default to user's home directory + /hours-backups
+			homeDir, err := os.UserHomeDir()
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get home directory: %w", err)
+			}
+			backupDir = filepath.Join(homeDir, "hours-backups")
+		}
+
+		backupService := backup.New(db)
+		backups, err := backupService.ListBackups(backupDir)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to list backups: %w", err)
+		}
+
+		if len(backups) == 0 {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{
+						Text: fmt.Sprintf("No backup files found in: %s", backupDir),
+					},
+				},
+			}, map[string]interface{}{
+				"backup_directory": backupDir,
+				"backups":          []interface{}{},
+				"count":            0,
+			}, nil
+		}
+
+		text := fmt.Sprintf("Found %d backup files in %s:\n", len(backups), backupDir)
+		for _, b := range backups {
+			text += fmt.Sprintf("- %s (Size: %s, Modified: %s)\n",
+				b.Name,
+				formatBytes(b.Size),
+				b.ModTime.Format("2006-01-02 15:04:05"))
+		}
+
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: text},
+			},
+		}, map[string]interface{}{
+			"backup_directory": backupDir,
+			"backups":          backups,
+			"count":            len(backups),
+		}, nil
+	})
+
+	// Validate Backup tool
+	type validateBackupArgs struct {
+		BackupPath string `json:"backup_path" jsonschema:"Path to the backup file to validate"`
+	}
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "validate_database_backup",
+		Description: "Validate that a backup file is valid and contains expected data",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args validateBackupArgs) (*mcp.CallToolResult, any, error) {
+		backupService := backup.New(db)
+
+		if err := backupService.ValidateBackup(args.BackupPath); err != nil {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{
+						Text: fmt.Sprintf("Backup validation failed: %s", err.Error()),
+					},
+				},
+			}, map[string]interface{}{
+				"backup_path": args.BackupPath,
+				"valid":       false,
+				"error":       err.Error(),
+			}, nil
+		}
+
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{
+					Text: fmt.Sprintf("Backup file is valid: %s", args.BackupPath),
+				},
+			},
+		}, map[string]interface{}{
+			"backup_path": args.BackupPath,
+			"valid":       true,
+		}, nil
+	})
 }
